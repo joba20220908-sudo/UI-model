@@ -52,3 +52,5 @@ backup/
 .env
 .env.local
 *.log
+Projects/hnw-licai/MindDeck-standalone.html
+Projects/hnw-licai/MindDeck-bundle.html
