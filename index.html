@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MindDeck · 项目列表</title>
+  <style>
+    /* ── 与 Prototype.html 相同的 CSS 变量 ── */
+    :root {
+      --bg-0:     #0d1117;
+      --bg-1:     #161b22;
+      --bg-2:     #1f2731;
+      --bg-3:     #252d38;
+      --fg:       #e6edf3;
+      --fg-dim:   #7d8590;
+      --fg-mute:  #484f58;
+      --line:     #2a3340;
+      --accent:   #58a6ff;
+      --accent-dim: #1f3860;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg-0);
+      color: var(--fg);
+      font-family: -apple-system, 'SF Pro Text', 'PingFang SC', '微软雅黑', sans-serif;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    .home-header {
+      padding: 32px 24px 20px;
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand-mark {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--fg-dim);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .brand-dot {
+      width: 8px; height: 8px;
+      background: var(--accent);
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .home-title {
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    .home-sub {
+      font-size: 12px;
+      color: var(--fg-mute);
+      margin-left: auto;
+    }
+
+    /* ── Grid ── */
+    .home-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 16px;
+      padding: 24px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    /* ── Card ── */
+    .project-card {
+      background: var(--bg-1);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      text-decoration: none;
+      color: inherit;
+      display: block;
+      transition: border-color .15s, box-shadow .15s, transform .12s;
+    }
+    .project-card:hover {
+      border-color: var(--accent-dim);
+      box-shadow: 0 4px 20px rgba(0,0,0,.35);
+      transform: translateY(-2px);
+    }
+    .card-thumb {
+      height: 160px;
+      background: var(--bg-2);
+      overflow: hidden;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+    }
+    .card-thumb img {
+      width: 100%;
+      object-fit: cover;
+      object-position: top;
+      display: block;
+    }
+    .card-thumb-ph {
+      width: 100%; height: 100%;
+      background: repeating-linear-gradient(
+        45deg,
+        #161a20 0 10px,
+        #1a1f26 10px 20px
+      );
+    }
+    .card-body { padding: 12px 14px 14px; }
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.4;
+      margin-bottom: 6px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .card-meta {
+      font-size: 11px;
+      color: var(--fg-dim);
+      margin-bottom: 4px;
+    }
+    .card-id {
+      font-size: 10px;
+      color: var(--fg-mute);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+
+    /* ── Empty state ── */
+    .home-empty {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 64px 24px;
+      color: var(--fg-mute);
+    }
+    .home-empty-title { font-size: 15px; margin-bottom: 8px; }
+    .home-empty-hint  { font-size: 12px; line-height: 1.7; }
+    .home-empty-hint code {
+      background: var(--bg-2);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'SF Mono', monospace;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+
+<header class="home-header">
+  <div class="brand-mark"><span class="brand-dot"></span>MindDeck</div>
+  <h1 class="home-title">项目列表</h1>
+  <div class="home-sub" id="home-sub">加载中…</div>
+</header>
+
+<main class="home-grid" id="home-grid"></main>
+
+<script>
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c =>
+    ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+fetch('projects.json')
+  .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+  .then(projects => {
+    const sub  = document.getElementById('home-sub');
+    const grid = document.getElementById('home-grid');
+    sub.textContent = projects.length ? `${projects.length} 个项目` : '';
+
+    if (!projects.length) {
+      grid.innerHTML = `
+        <div class="home-empty">
+          <div class="home-empty-title">暂无项目</div>
+          <div class="home-empty-hint">
+            运行以下命令导入 XMind 文件：<br>
+            <code>bash scripts/launch.sh your-file.xmind</code>
+          </div>
+        </div>`;
+      return;
+    }
+
+    for (const p of projects) {
+      const card = document.createElement('a');
+      card.href      = p.url;
+      card.className = 'project-card';
+      card.innerHTML = `
+        <div class="card-thumb">
+          ${p.thumbnail
+            ? `<img src="${escapeHtml(p.thumbnail)}" loading="lazy" alt="">`
+            : '<div class="card-thumb-ph"></div>'}
+        </div>
+        <div class="card-body">
+          <div class="card-title">${escapeHtml(p.title)}</div>
+          <div class="card-meta">${p.nodeCount} 节点 · ${p.shotCount} 截图</div>
+          <div class="card-id">${escapeHtml(p.name)}</div>
+        </div>`;
+      grid.appendChild(card);
+    }
+  })
+  .catch(() => {
+    document.getElementById('home-sub').textContent = '无法加载项目列表';
+    document.getElementById('home-grid').innerHTML = `
+      <div class="home-empty">
+        <div class="home-empty-title">无法加载 projects.json</div>
+        <div class="home-empty-hint">请通过 <code>launch.sh</code> 或 <code>MindDeck.command</code> 启动，不要直接双击打开 HTML 文件。</div>
+      </div>`;
+  });
+</script>
+</body>
+</html>

@@ -52,8 +52,13 @@ function extractJsonArray(text) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-async function askModelForTile(tile, targets) {
-  const prompt = `这是一张移动端 APP 截图的一部分,尺寸 ${tile.tileW}×${tile.tileH} 像素(坐标原点在本切片左上角)。
+async function askModelForTile(tile, targets, context = {}) {
+  const { appName = '', nodeNote = '' } = context;
+  const contextLine = appName
+    ? `这是「${appName}」移动端 APP 的产品原型截图。${nodeNote ? `当前页面设计要求：${nodeNote}` : ''}\n\n`
+    : '';
+
+  const prompt = `${contextLine}这是一张移动端 APP 截图的一部分,尺寸 ${tile.tileW}×${tile.tileH} 像素(坐标原点在本切片左上角)。
 
 请在本切片中找以下目标元素对应的可点击区域(按钮/导航项/列表行/卡片/Tab 标签),返回紧贴其外边框的 bbox 像素坐标。
 
@@ -104,9 +109,10 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003 } = {}) {
   const fullW = tiles[0].fullW, fullH = tiles[0].fullH;
   const targets = kids.map(k => k.title);
 
+  const context = { appName: (typeof META !== 'undefined' && META.title) ? META.title : '', nodeNote: node.note || '' };
   const candidates = {};
   for (const tile of tiles) {
-    const res = await askModelForTile(tile, targets);
+    const res = await askModelForTile(tile, targets, context);
     if (!res.ok) continue;
     for (const item of res.arr) {
       if (!item || !Array.isArray(item.bbox) || item.bbox.length !== 4) continue;
@@ -167,7 +173,11 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003 } = {}) {
     if (!changed) break;
   }
 
-  ok.forEach(r => saveHotspotPosition(node.uid, r.uid, { ...r.pos, conf: r.conf, manual: false }));
+  const existingStore = loadHotspotPositions();
+  ok.forEach(r => {
+    if (existingStore[node.uid]?.[r.uid]?.manual === true) return;
+    saveHotspotPosition(node.uid, r.uid, { ...r.pos, conf: r.conf, manual: false });
+  });
   return { ok: true, results, tiles: tiles.length };
 }
 
@@ -215,11 +225,13 @@ async function autolocateAll() {
   if (!window.confirm(`将对 ${candidates.length} 个父页面批量调用 AI 识别热点(约需 ${candidates.length * 3} 秒)。确认继续?`)) return;
 
   btn.disabled = true;
+  btn.style.minWidth = '180px';
   const origText = btn.textContent;
   let okCount = 0, failCount = 0;
   for (let i = 0; i < candidates.length; i++) {
     const node = candidates[i];
-    btn.textContent = `${i + 1}/${candidates.length}`;
+    const shortTitle = node.title.length > 8 ? node.title.slice(0, 8) + '…' : node.title;
+    btn.textContent = `识别「${shortTitle}」(${i + 1}/${candidates.length})`;
     try {
       const res = await autolocateNode(node);
       if (res.ok && res.results.some(r => r.status === 'ok')) okCount++;
@@ -229,6 +241,7 @@ async function autolocateAll() {
       console.error('autolocate failed for', node.title, e);
     }
   }
+  btn.style.minWidth = '';
   btn.textContent = `✓ ${okCount}/${candidates.length}`;
   renderScreen(nodeIndex.get(CURRENT));
   setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 3000);

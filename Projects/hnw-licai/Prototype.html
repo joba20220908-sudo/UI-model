@@ -49,6 +49,17 @@
     flex-direction: column;
     overflow: hidden;
   }
+  .back-to-list {
+    display: inline-block;
+    font-size: 11px;
+    color: var(--fg-mute);
+    text-decoration: none;
+    margin-bottom: 8px;
+    transition: color .12s;
+    letter-spacing: 0.2px;
+  }
+  .back-to-list:hover { color: var(--accent); }
+
   .sidebar-header {
     padding: 14px 18px 14px;
     border-bottom: 1px solid var(--line);
@@ -1042,6 +1053,7 @@
   <!-- 左侧大纲 -->
   <aside class="sidebar">
     <div class="sidebar-header">
+      <a href="../../index.html" class="back-to-list">← 项目列表</a>
       <div class="brand-mark"><span class="brand-dot"></span>MindDeck</div>
       <h1 id="project-title">评审原型</h1>
       <div class="sub" id="project-sub">加载中…</div>

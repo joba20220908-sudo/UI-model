@@ -49,6 +49,9 @@ PROJECT_DIR="$PROJECTS_DIR/$BASE_NAME"
 echo "▶ 解析 $BASE_NAME.xmind ..."
 "$NODE_BIN" "$SCRIPT_DIR/parse-xmind.js" "$XMIND_FILE" "$PROJECT_DIR"
 
+echo "▶ 更新项目清单 ..."
+"$NODE_BIN" "$SCRIPT_DIR/gen-manifest.js" "$ROOT_DIR"
+
 # ── 复制模板文件（HTML + JS 模块）────────────────────────────────────────────
 echo "▶ 复制模板文件 ..."
 JS_MODULES=(storage.js tree.js hotspots.js comments-ui.js screen.js export-ui.js ai.js app.js)
@@ -83,11 +86,11 @@ while lsof -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; do
   PORT=$((PORT + 1))
 done
 
-URL="http://localhost:$PORT/Prototype.html"
+URL="http://localhost:$PORT/"
 
-# ── 启动 HTTP 服务器（后台）──────────────────────────────────────────────────
+# ── 启动 HTTP 服务器（后台，从根目录服务）────────────────────────────────────
 echo "▶ 启动服务器 → $URL"
-cd "$PROJECT_DIR"
+cd "$ROOT_DIR"
 "$PYTHON_BIN" -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
 SERVER_PID=$!
 
