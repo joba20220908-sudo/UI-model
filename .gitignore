@@ -1,0 +1,54 @@
+# ──────────────── OS / 编辑器 ────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+
+# ──────────────── Node / 依赖(未来用到)────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# ──────────────── MindDeck 专属 ────────────────
+
+# sandbox 的缩略图/草稿,不进 git
+scraps/
+.thumbnails/
+
+# 调试中间产物(体积大且可再生)
+debug/*.jpg
+debug/*.jpeg
+debug/*.png
+debug/tree.json
+debug/tree-clean.json
+
+# XMind 解析过程文件(产物已经在 data.js 里)
+parsed/
+
+# 用户上传的原始图(已经选择后拷贝到 screenshots/ 了)
+# 如果想保留源文件,把下一行注释掉
+uploads/
+
+# 根目录遗留的调试版本(保留会和 Template 冲突)
+# 注意:首次 push 时可以保留,之后要不要 ignore 自己决定
+# /Prototype.html
+# /app.js
+# /data.js
+# /screenshots/
+
+# ──────────────── 导出/备份 ────────────────
+*.zip
+*.tar.gz
+backup/
+*-export-*.json
+
+# ──────────────── 环境 ────────────────
+.env
+.env.local
+*.log
