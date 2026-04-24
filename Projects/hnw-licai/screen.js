@@ -1,5 +1,6 @@
 // ===== 屏幕渲染 =====
 async function renderScreen(node) {
+  cleanupCandidates();
   const screen = document.getElementById('screen');
   screen.innerHTML = '';
 

@@ -12,7 +12,7 @@ async function loadImage(url) {
 }
 
 // 把整图切成 tile,返回 [{b64, tileW, tileH, offsetYInFull, fullW, fullH}, ...]
-async function sliceForModel(img, { targetW = 600, tileH = 900, overlap = 120 } = {}) {
+async function sliceForModel(img, { targetW = 900, tileH = 900, overlap = 200 } = {}) {
   const scale = Math.min(1, targetW / img.naturalWidth);
   const fullW = Math.round(img.naturalWidth * scale);
   const fullH = Math.round(img.naturalHeight * scale);
@@ -173,11 +173,6 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003 } = {}) {
     if (!changed) break;
   }
 
-  const existingStore = loadHotspotPositions();
-  ok.forEach(r => {
-    if (existingStore[node.uid]?.[r.uid]?.manual === true) return;
-    saveHotspotPosition(node.uid, r.uid, { ...r.pos, conf: r.conf, manual: false });
-  });
   return { ok: true, results, tiles: tiles.length };
 }
 
@@ -201,9 +196,14 @@ async function autolocateCurrent() {
     }
     const okCount = res.results.filter(r => r.status === 'ok').length;
     const total = res.results.length;
-    btn.textContent = `✓ ${okCount}/${total}${res.tiles > 1 ? ` · ${res.tiles}块` : ''}`;
-    renderScreen(node);
-    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2500);
+    btn.textContent = origText;
+    btn.disabled = false;
+    if (!okCount) {
+      btn.textContent = `✗ 0/${total}`;
+      setTimeout(() => { btn.textContent = origText; }, 2000);
+      return;
+    }
+    showHotspotCandidates(node, res.results);
   } catch (e) {
     btn.textContent = '✗ 异常';
     console.error(e);
@@ -234,6 +234,7 @@ async function autolocateAll() {
     btn.textContent = `识别「${shortTitle}」(${i + 1}/${candidates.length})`;
     try {
       const res = await autolocateNode(node);
+      if (res.ok) commitResults(node.uid, res.results);
       if (res.ok && res.results.some(r => r.status === 'ok')) okCount++;
       else failCount++;
     } catch (e) {
@@ -245,4 +246,119 @@ async function autolocateAll() {
   btn.textContent = `✓ ${okCount}/${candidates.length}`;
   renderScreen(nodeIndex.get(CURRENT));
   setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 3000);
+}
+
+// ===== 候选热区确认 UI =====
+
+function commitResults(parentUid, results) {
+  const existingStore = loadHotspotPositions();
+  results.filter(r => r.status === 'ok').forEach(r => {
+    if (existingStore[parentUid]?.[r.uid]?.manual === true) return;
+    saveHotspotPosition(parentUid, r.uid, { ...r.pos, conf: r.conf, manual: false });
+  });
+}
+
+function showHotspotCandidates(node, results) {
+  const screen = document.getElementById('screen');
+  const wrap = screen?.querySelector('.shot-wrap');
+  if (!wrap) return;
+  cleanupCandidates();
+
+  const okResults = results.filter(r => r.status === 'ok');
+  if (!okResults.length) return;
+
+  const layer = document.createElement('div');
+  layer.className = 'hs-candidate-layer';
+  layer.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:8;';
+  wrap.appendChild(layer);
+
+  const selected = new Map(okResults.map(r => [r.uid, true]));
+
+  function renderBoxes() {
+    layer.querySelectorAll('.hs-candidate').forEach(el => el.remove());
+    okResults.forEach(r => {
+      const { xPct, yPct, wPct, hPct } = r.pos;
+      const isOn = selected.get(r.uid);
+      const box = document.createElement('div');
+      box.className = 'hs-candidate' + (isOn ? ' selected' : ' rejected');
+      box.style.cssText = `left:${xPct}%;top:${yPct}%;width:${wPct}%;height:${hPct}%;`;
+
+      const conf = document.createElement('span');
+      conf.className = 'hs-cand-conf';
+      conf.textContent = Math.round(r.conf * 100) + '%';
+
+      const lbl = document.createElement('span');
+      lbl.className = 'hs-cand-label';
+      lbl.textContent = r.label;
+
+      const acceptBtn = document.createElement('button');
+      acceptBtn.className = 'hs-cand-btn accept';
+      acceptBtn.textContent = '✓';
+      acceptBtn.addEventListener('click', e => { e.stopPropagation(); selected.set(r.uid, true); renderBoxes(); updateBar(); });
+
+      const rejectBtn = document.createElement('button');
+      rejectBtn.className = 'hs-cand-btn reject';
+      rejectBtn.textContent = '✗';
+      rejectBtn.addEventListener('click', e => { e.stopPropagation(); selected.set(r.uid, false); renderBoxes(); updateBar(); });
+
+      const actions = document.createElement('div');
+      actions.className = 'hs-cand-actions';
+      actions.append(acceptBtn, rejectBtn);
+      box.append(conf, lbl, actions);
+
+      box.style.pointerEvents = 'auto';
+      box.addEventListener('click', () => { selected.set(r.uid, !selected.get(r.uid)); renderBoxes(); updateBar(); });
+      layer.appendChild(box);
+    });
+  }
+
+  const stageEl = document.getElementById('stage');
+  const bar = document.createElement('div');
+  bar.className = 'hs-candidate-bar';
+  bar.id = 'hs-candidate-bar';
+  stageEl.appendChild(bar);
+
+  function updateBar() {
+    const acceptedCount = [...selected.values()].filter(Boolean).length;
+    bar.innerHTML = '';
+
+    const info = document.createElement('span');
+    info.className = 'hs-bar-info';
+    info.textContent = `AI 建议 ${okResults.length} 个热点 · 已选 ${acceptedCount}`;
+
+    const acceptAll = document.createElement('button');
+    acceptAll.className = 'hs-bar-btn accept-all';
+    acceptAll.textContent = '✓ 全部接受';
+    acceptAll.addEventListener('click', () => { okResults.forEach(r => selected.set(r.uid, true)); renderBoxes(); updateBar(); });
+
+    const rejectAll = document.createElement('button');
+    rejectAll.className = 'hs-bar-btn reject-all';
+    rejectAll.textContent = '✗ 全部放弃';
+    rejectAll.addEventListener('click', () => { okResults.forEach(r => selected.set(r.uid, false)); renderBoxes(); updateBar(); });
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'hs-bar-btn save';
+    saveBtn.disabled = acceptedCount === 0;
+    saveBtn.textContent = `保存选中 (${acceptedCount})`;
+    saveBtn.addEventListener('click', () => {
+      commitResults(node.uid, okResults.filter(r => selected.get(r.uid)));
+      cleanupCandidates();
+      renderScreen(nodeIndex.get(CURRENT));
+    });
+
+    bar.append(info, acceptAll, rejectAll, saveBtn);
+  }
+
+  function onKeyDown(e) { if (e.key === 'Escape') cleanupCandidates(); }
+  document.addEventListener('keydown', onKeyDown);
+  layer._cleanup = () => document.removeEventListener('keydown', onKeyDown);
+
+  renderBoxes();
+  updateBar();
+}
+
+function cleanupCandidates() {
+  const layer = document.querySelector('.hs-candidate-layer');
+  if (layer) { layer._cleanup?.(); layer.remove(); }
+  document.getElementById('hs-candidate-bar')?.remove();
 }

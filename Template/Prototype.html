@@ -1044,6 +1044,128 @@
     border-radius: 5px;
     border: 1px dashed var(--line);
   }
+
+  /* ===== AI 候选热区确认 UI ===== */
+  .hs-candidate-bar {
+    position: absolute;
+    top: 44px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: var(--bg-1);
+    border: 1px solid var(--line);
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.45);
+    white-space: nowrap;
+    font-size: 12px;
+    color: var(--fg-dim);
+    pointer-events: auto;
+  }
+  .hs-bar-info { font-size: 11px; margin-right: 4px; }
+  .hs-bar-btn {
+    padding: 3px 9px;
+    border-radius: 5px;
+    border: 1px solid var(--line);
+    background: var(--bg-2);
+    color: var(--fg-dim);
+    font-size: 11px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all .12s;
+  }
+  .hs-bar-btn:hover { color: var(--fg); border-color: var(--accent-dim); }
+  .hs-bar-btn.accept-all { color: #4ade80; border-color: rgba(74,222,128,.35); }
+  .hs-bar-btn.accept-all:hover { background: rgba(74,222,128,.12); }
+  .hs-bar-btn.reject-all { color: #f87171; border-color: rgba(248,113,113,.35); }
+  .hs-bar-btn.reject-all:hover { background: rgba(248,113,113,.12); }
+  .hs-bar-btn.save {
+    background: rgba(88,166,255,.18);
+    border-color: var(--accent-dim);
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .hs-bar-btn.save:hover { background: rgba(88,166,255,.28); }
+  .hs-bar-btn.save:disabled { opacity: .4; cursor: not-allowed; pointer-events: none; }
+
+  .hs-candidate {
+    position: absolute;
+    border-radius: 5px;
+    cursor: pointer;
+    user-select: none;
+    transition: background .1s, border-color .1s, opacity .1s;
+    background: rgba(88,166,255,.12);
+    border: 1.5px dashed rgba(88,166,255,.8);
+  }
+  .hs-candidate:hover { background: rgba(88,166,255,.22); border-color: #58a6ff; }
+  .hs-candidate.rejected {
+    background: rgba(120,120,120,.08);
+    border: 1.5px dashed rgba(120,120,120,.35);
+    opacity: .55;
+  }
+  .hs-candidate.rejected:hover { opacity: .75; }
+
+  .hs-cand-conf {
+    position: absolute;
+    top: -1px; right: -1px;
+    background: #58a6ff;
+    color: #0b0d10;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 0 4px 0 5px;
+    pointer-events: none;
+  }
+  .hs-candidate.rejected .hs-cand-conf { background: rgba(120,120,120,.5); color: var(--fg-dim); }
+
+  .hs-cand-label {
+    position: absolute;
+    bottom: -1px; left: -1px; right: 0;
+    font-size: 9px;
+    color: rgba(200,220,255,.9);
+    background: rgba(20,30,50,.82);
+    padding: 1px 5px;
+    border-radius: 0 0 4px 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  .hs-candidate.rejected .hs-cand-label { color: var(--fg-mute); background: rgba(10,10,10,.7); }
+
+  .hs-cand-actions {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity .12s;
+    pointer-events: none;
+  }
+  .hs-candidate:hover .hs-cand-actions { opacity: 1; pointer-events: auto; }
+
+  .hs-cand-btn {
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    border: none;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4);
+    transition: transform .1s;
+  }
+  .hs-cand-btn:hover { transform: scale(1.15); }
+  .hs-cand-btn.accept { background: #4ade80; color: #0b1a12; }
+  .hs-cand-btn.reject { background: #f87171; color: #1a0b0b; }
 </style>
 </head>
 <body>
