@@ -1592,100 +1592,11 @@ async function loadImage(url) {
   });
 }
 
-// 把整图切成 tile。返回 [{b64, sx, sy, sw, sh, tileW, tileH}, ...]
-// sx/sy/sw/sh 是该 tile 对应**原图**的区域;tileW/tileH 是 tile 实际像素(喂给模型的)
-async function sliceForModel(img, { targetW = 600, tileH = 900, overlap = 120 } = {}) {
-  const scale = Math.min(1, targetW / img.naturalWidth);
-  const fullW = Math.round(img.naturalWidth * scale);
-  const fullH = Math.round(img.naturalHeight * scale);
+// AI 定位逻辑已抽到 locator.js（provider 链：ocrServer → windowClaude → zhipuVision）
+// 这里只保留 autolocateNode：调用 window.locateHotspots → 选择最佳候选 → 消除重叠。
+// 加新 provider 看 locator.js。
 
-  // 先把整图缩放到 fullW × fullH 的一张 canvas,再在这张 canvas 上按 tileH 切块
-  const full = document.createElement('canvas');
-  full.width = fullW; full.height = fullH;
-  full.getContext('2d').drawImage(img, 0, 0, fullW, fullH);
-
-  const tiles = [];
-  if (fullH <= tileH) {
-    // 单块即可
-    tiles.push({
-      canvas: full,
-      tileW: fullW, tileH: fullH,
-      offsetYInFull: 0,
-      fullW, fullH
-    });
-  } else {
-    let y = 0;
-    while (y < fullH) {
-      const h = Math.min(tileH, fullH - y);
-      const c = document.createElement('canvas');
-      c.width = fullW; c.height = h;
-      c.getContext('2d').drawImage(full, 0, y, fullW, h, 0, 0, fullW, h);
-      tiles.push({
-        canvas: c,
-        tileW: fullW, tileH: h,
-        offsetYInFull: y,
-        fullW, fullH
-      });
-      if (y + h >= fullH) break;
-      y += (tileH - overlap);
-    }
-  }
-
-  // 输出 b64
-  return tiles.map(t => ({
-    b64: t.canvas.toDataURL('image/jpeg', 0.8).split(',')[1],
-    tileW: t.tileW, tileH: t.tileH,
-    offsetYInFull: t.offsetYInFull,
-    fullW: t.fullW, fullH: t.fullH
-  }));
-}
-
-function extractJsonArray(text) {
-  let s = (text || '').trim();
-  const m = s.match(/\[[\s\S]*\]/);
-  if (m) s = m[0];
-  try { return JSON.parse(s); } catch { return null; }
-}
-
-async function askModelForTile(tile, targets) {
-  const prompt = `这是一张移动端 APP 截图的一部分,尺寸 ${tile.tileW}×${tile.tileH} 像素(坐标原点在本切片左上角)。
-
-请在本切片中找以下目标元素对应的可点击区域(按钮/导航项/列表行/卡片/Tab 标签),返回紧贴其外边框的 bbox 像素坐标。
-
-目标元素:
-${targets.map((t, i) => `${i + 1}. "${t}"`).join('\n')}
-
-规则:
-- 仅返回**本切片内**能看到的元素;完全不在本切片内的目标不要返回
-- 短文本 tab/按钮:bbox 覆盖整个按钮容器,不要只框文字
-- 列表行:bbox 宽度覆盖整行
-- 若同一目标出现多次,取最上面/最醒目那一个
-- 忽略状态栏、底部系统 Tab Bar、返回图标等无关元素
-- confidence 表示你对定位的把握 (0.0-1.0)
-
-严格返回 JSON 数组,无任何额外文字或代码块标记:
-[{"label":"原样复制的目标文字","bbox":[x,y,w,h],"confidence":0.0-1.0}]
-如果本切片中一个目标都没找到,返回 []`;
-
-  let raw;
-  try {
-    raw = await window.claude.complete({
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: tile.b64 } },
-          { type: 'text', text: prompt }
-        ]
-      }]
-    });
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-  const arr = extractJsonArray(raw);
-  return { ok: true, arr: Array.isArray(arr) ? arr : [], raw };
-}
-
-async function autolocateNode(node, { minConf = 0.6, pad = 0.003 } = {}) {
+async function autolocateNode(node, { minConf = 0.6, pad = 0.003, dryRun = false } = {}) {
   const url = await resolveNodeImageUrl(node);
   if (!url) return { ok: false, reason: 'no-image' };
   const kids = node.children.filter(c => nodeHasImage(c) || c.children.length > 0);
@@ -1695,32 +1606,15 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003 } = {}) {
   try { img = await loadImage(url); }
   catch (e) { return { ok: false, reason: 'img-load-fail' }; }
 
-  const tiles = await sliceForModel(img);
-  const fullW = tiles[0].fullW, fullH = tiles[0].fullH;
   const targets = kids.map(k => k.title);
 
-  // 每块一次模型调用;收集全部候选
-  // 结构: { label: [{xInFull, yInFull, w, h, conf}, ...] }
-  const candidates = {};
-  for (const tile of tiles) {
-    const res = await askModelForTile(tile, targets);
-    if (!res.ok) continue;
-    for (const item of res.arr) {
-      if (!item || !Array.isArray(item.bbox) || item.bbox.length !== 4) continue;
-      const label = item.label;
-      const conf = Number(item.confidence) || 0;
-      const [x, y, w, h] = item.bbox.map(Number);
-      if (![x, y, w, h].every(Number.isFinite)) continue;
-      if (w <= 0 || h <= 0) continue;
-      // 忽略明显占满切片的无意义框
-      if (w >= tile.tileW * 0.98 && h >= tile.tileH * 0.98) continue;
-      (candidates[label] = candidates[label] || []).push({
-        xInFull: x,
-        yInFull: y + tile.offsetYInFull,
-        w, h, conf
-      });
-    }
+  // 调 locator 链：ocrServer → windowClaude → zhipuVision，第一个命中的赢
+  if (typeof window.locateHotspots !== 'function') {
+    return { ok: false, reason: 'locator-missing', error: 'locator.js 未加载（检查 Prototype.html）' };
   }
+  const located = await window.locateHotspots({ img, targets });
+  if (!located) return { ok: false, reason: 'no-candidates' };
+  const { candidates, fullW, fullH, source } = located;
 
   // 为每个 kid 选最佳候选(conf 最高,其次 y 最小)
   const results = [];
@@ -1775,10 +1669,102 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003 } = {}) {
     if (!changed) break;
   }
 
-  // 持久化(连同 conf 一起,用来标记低置信度热区)
-  ok.forEach(r => saveHotspotPosition(node.uid, r.uid, { ...r.pos, conf: r.conf, manual: false }));
+  if (!dryRun) {
+    ok.forEach(r => saveHotspotPosition(node.uid, r.uid, { ...r.pos, conf: r.conf, manual: false }));
+  }
 
-  return { ok: true, results, tiles: tiles.length };
+  return { ok: true, results, source, imageUrl: url, fullW, fullH };
+}
+
+function commitResults(parentNode, results) {
+  results.filter(r => r.status === 'ok').forEach(r => {
+    saveHotspotPosition(parentNode.uid, r.uid, { ...r.pos, conf: r.conf, manual: false });
+  });
+}
+
+function showHotspotCandidates(node, res) {
+  document.querySelectorAll('.modal-overlay').forEach(n => n.remove());
+
+  const okCount = res.results.filter(r => r.status === 'ok').length;
+  const total = res.results.length;
+
+  const statusLabel = s => s === 'ok' ? '✓ 识别成功' : s === 'low-conf' ? '⚠ 置信度低' : '✗ 未找到';
+  const statusColor = s => s === 'ok' ? '#4caf50' : s === 'low-conf' ? '#ff9800' : '#f44336';
+
+  const rowsHtml = res.results.map(r => `
+    <tr>
+      <td style="padding:5px 8px;font-size:12px;color:var(--fg)">${r.label}</td>
+      <td style="padding:5px 8px;font-size:12px;color:${statusColor(r.status)}">${statusLabel(r.status)}</td>
+      <td style="padding:5px 8px;font-size:12px;color:var(--fg-dim)">${r.conf != null ? (r.conf * 100).toFixed(0) + '%' : '—'}</td>
+    </tr>`).join('');
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" style="width:640px;max-width:95vw">
+      <div class="modal-header">
+        <span>热点识别结果 · ${node.title}</span>
+        <button class="modal-close">✕</button>
+      </div>
+      <div class="modal-body" style="gap:12px">
+        <div style="position:relative;display:inline-block;align-self:center;max-width:100%">
+          <img id="cand-img" src="${res.imageUrl}" style="display:block;max-width:100%;max-height:45vh;border-radius:6px;border:1px solid var(--line)">
+          <div id="cand-boxes"></div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:6px;overflow:hidden">
+          <thead>
+            <tr style="background:var(--bg-2)">
+              <th style="padding:6px 8px;font-size:11px;text-align:left;color:var(--fg-dim)">节点</th>
+              <th style="padding:6px 8px;font-size:11px;text-align:left;color:var(--fg-dim)">状态</th>
+              <th style="padding:6px 8px;font-size:11px;text-align:left;color:var(--fg-dim)">置信度</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+        <p style="font-size:12px;color:var(--fg-dim);margin:0">识别到 ${okCount}/${total} 个热点。应用后可用 Shift+拖拽微调位置。</p>
+      </div>
+      <div class="modal-footer">
+        <button data-act="cancel" style="padding:6px 16px;background:var(--bg-2);border:1px solid var(--line);border-radius:6px;cursor:pointer;color:var(--fg);font-size:13px">取消</button>
+        <button data-act="apply" style="padding:6px 16px;background:var(--accent);border:none;border-radius:6px;cursor:pointer;color:#fff;font-size:13px" ${okCount === 0 ? 'disabled' : ''}>应用 ${okCount} 个热点</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  // 图片加载完后绘制候选框
+  const img = overlay.querySelector('#cand-img');
+  const boxContainer = overlay.querySelector('#cand-boxes');
+  const drawBoxes = () => {
+    boxContainer.innerHTML = '';
+    const rect = img.getBoundingClientRect();
+    const iw = img.offsetWidth, ih = img.offsetHeight;
+    res.results.filter(r => r.status === 'ok' || r.status === 'low-conf').forEach(r => {
+      const box = document.createElement('div');
+      const color = statusColor(r.status);
+      box.style.cssText = `position:absolute;pointer-events:none;box-sizing:border-box;
+        left:${r.pos.xPct}%;top:${r.pos.yPct}%;
+        width:${r.pos.wPct}%;height:${r.pos.hPct}%;
+        border:2px solid ${color};border-radius:3px`;
+      const label = document.createElement('span');
+      label.textContent = r.label;
+      label.style.cssText = `position:absolute;top:-18px;left:0;
+        font-size:10px;white-space:nowrap;padding:1px 4px;border-radius:3px;
+        background:${color};color:#fff;line-height:16px`;
+      box.appendChild(label);
+      boxContainer.appendChild(box);
+    });
+    boxContainer.style.cssText = `position:absolute;inset:0;pointer-events:none`;
+  };
+  if (img.complete) drawBoxes(); else img.addEventListener('load', drawBoxes);
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  overlay.querySelector('.modal-close').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('[data-act="cancel"]').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('[data-act="apply"]').addEventListener('click', () => {
+    commitResults(node, res.results);
+    renderScreen(nodeIndex.get(CURRENT));
+    overlay.remove();
+  });
 }
 
 async function autolocateCurrent() {
@@ -1789,7 +1775,7 @@ async function autolocateCurrent() {
   const origText = btn.textContent;
   btn.textContent = '识别中…';
   try {
-    const res = await autolocateNode(node);
+    const res = await autolocateNode(node, { dryRun: true });
     if (!res.ok) {
       btn.textContent = '✗ ' + (res.reason === 'no-children' ? '无子页' : res.reason === 'no-image' ? '无截图' : res.reason === 'img-load-fail' ? '图加载失败' : '失败');
       setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
@@ -1797,14 +1783,14 @@ async function autolocateCurrent() {
     }
     const ok = res.results.filter(r => r.status === 'ok').length;
     const total = res.results.length;
-    btn.textContent = `✓ ${ok}/${total}${res.tiles > 1 ? ` · ${res.tiles}块` : ''}`;
-    // 重新渲染当前屏以应用新位置
-    renderScreen(node);
-    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2500);
+    btn.textContent = `${ok}/${total}${res.source ? ` · ${res.source}` : ''} 待确认`;
+    showHotspotCandidates(node, res);
   } catch (e) {
     btn.textContent = '✗ 异常';
     console.error(e);
     setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
+  } finally {
+    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 3000);
   }
 }
 
@@ -1813,15 +1799,27 @@ async function autolocateAll() {
   const btn = document.getElementById('btn-autolocate-all');
   const allBtn = btn;
   // 收集候选
-  const candidates = [];
+  const allCandidates = [];
   (function walk(n) {
     if (nodeHasImage(n) && n.children.some(c => nodeHasImage(c) || c.children.length > 0)) {
-      candidates.push(n);
+      allCandidates.push(n);
     }
     n.children.forEach(walk);
   })(TREE);
 
-  const confirm = window.confirm(`将对 ${candidates.length} 个父页面批量调用 AI 识别热点(约需 ${candidates.length * 3} 秒)。确认继续?`);
+  // 过滤：跳过所有子节点都已 manual=true 微调的父节点（保护用户手工结果，避免重复跑 OCR）
+  const hsAll = loadHotspotPositions();
+  const candidates = allCandidates.filter(n => {
+    const kids = n.children.filter(c => nodeHasImage(c) || c.children.length > 0);
+    if (!kids.length) return false;
+    const parentHs = hsAll[n.uid] || {};
+    const allManual = kids.every(k => parentHs[k.uid]?.manual === true);
+    return !allManual;
+  });
+  const skipped = allCandidates.length - candidates.length;
+
+  const skipMsg = skipped > 0 ? `（跳过 ${skipped} 个已手动微调完成的节点）` : '';
+  const confirm = window.confirm(`将对 ${candidates.length} 个父页面批量调用 AI 识别热点${skipMsg}\n约需 ${candidates.length * 3} 秒。确认继续?`);
   if (!confirm) return;
 
   allBtn.disabled = true;
