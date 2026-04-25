@@ -1685,7 +1685,7 @@ ${targets.map((t, i) => `${i + 1}. "${t}"`).join('\n')}
   return { ok: true, arr: Array.isArray(arr) ? arr : [], raw };
 }
 
-async function autolocateNode(node, { minConf = 0.6, pad = 0.003 } = {}) {
+async function autolocateNode(node, { minConf = 0.6, pad = 0.003, dryRun = false } = {}) {
   const url = await resolveNodeImageUrl(node);
   if (!url) return { ok: false, reason: 'no-image' };
   const kids = node.children.filter(c => nodeHasImage(c) || c.children.length > 0);
@@ -1775,10 +1775,99 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003 } = {}) {
     if (!changed) break;
   }
 
-  // 持久化(连同 conf 一起,用来标记低置信度热区)
-  ok.forEach(r => saveHotspotPosition(node.uid, r.uid, { ...r.pos, conf: r.conf, manual: false }));
+  if (!dryRun) {
+    ok.forEach(r => saveHotspotPosition(node.uid, r.uid, { ...r.pos, conf: r.conf, manual: false }));
+  }
 
-  return { ok: true, results, tiles: tiles.length };
+  return { ok: true, results, tiles: tiles.length, imageUrl: url, fullW, fullH };
+}
+
+function commitResults(parentNode, results) {
+  results.filter(r => r.status === 'ok').forEach(r => {
+    saveHotspotPosition(parentNode.uid, r.uid, { ...r.pos, conf: r.conf, manual: false });
+  });
+}
+
+function showHotspotCandidates(node, res) {
+  document.querySelectorAll('.modal-overlay').forEach(n => n.remove());
+
+  const okCount = res.results.filter(r => r.status === 'ok').length;
+  const total = res.results.length;
+
+  const statusLabel = s => s === 'ok' ? '✓ 识别成功' : s === 'low-conf' ? '⚠ 置信度低' : '✗ 未找到';
+  const statusColor = s => s === 'ok' ? '#4caf50' : s === 'low-conf' ? '#ff9800' : '#f44336';
+
+  const rowsHtml = res.results.map(r => `
+    <tr>
+      <td style="padding:5px 8px;font-size:12px;color:var(--fg)">${r.label}</td>
+      <td style="padding:5px 8px;font-size:12px;color:${statusColor(r.status)}">${statusLabel(r.status)}</td>
+      <td style="padding:5px 8px;font-size:12px;color:var(--fg-dim)">${r.conf != null ? (r.conf * 100).toFixed(0) + '%' : '—'}</td>
+    </tr>`).join('');
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" style="width:640px;max-width:95vw">
+      <div class="modal-header">
+        <span>热点识别结果 · ${node.title}</span>
+        <button class="modal-close">✕</button>
+      </div>
+      <div class="modal-body" style="gap:12px">
+        <div style="position:relative;display:inline-block;align-self:center;max-width:100%">
+          <img id="cand-img" src="${res.imageUrl}" style="display:block;max-width:100%;max-height:45vh;border-radius:6px;border:1px solid var(--line)">
+          <div id="cand-boxes"></div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:6px;overflow:hidden">
+          <thead>
+            <tr style="background:var(--bg-2)">
+              <th style="padding:6px 8px;font-size:11px;text-align:left;color:var(--fg-dim)">节点</th>
+              <th style="padding:6px 8px;font-size:11px;text-align:left;color:var(--fg-dim)">状态</th>
+              <th style="padding:6px 8px;font-size:11px;text-align:left;color:var(--fg-dim)">置信度</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+        <p style="font-size:12px;color:var(--fg-dim);margin:0">识别到 ${okCount}/${total} 个热点。应用后可用 Shift+拖拽微调位置。</p>
+      </div>
+      <div class="modal-footer">
+        <button data-act="cancel" style="padding:6px 16px;background:var(--bg-2);border:1px solid var(--line);border-radius:6px;cursor:pointer;color:var(--fg);font-size:13px">取消</button>
+        <button data-act="apply" style="padding:6px 16px;background:var(--accent);border:none;border-radius:6px;cursor:pointer;color:#fff;font-size:13px" ${okCount === 0 ? 'disabled' : ''}>应用 ${okCount} 个热点</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  const img = overlay.querySelector('#cand-img');
+  const boxContainer = overlay.querySelector('#cand-boxes');
+  const drawBoxes = () => {
+    boxContainer.innerHTML = '';
+    res.results.filter(r => r.status === 'ok' || r.status === 'low-conf').forEach(r => {
+      const box = document.createElement('div');
+      const color = statusColor(r.status);
+      box.style.cssText = `position:absolute;pointer-events:none;box-sizing:border-box;
+        left:${r.pos.xPct}%;top:${r.pos.yPct}%;
+        width:${r.pos.wPct}%;height:${r.pos.hPct}%;
+        border:2px solid ${color};border-radius:3px`;
+      const label = document.createElement('span');
+      label.textContent = r.label;
+      label.style.cssText = `position:absolute;top:-18px;left:0;
+        font-size:10px;white-space:nowrap;padding:1px 4px;border-radius:3px;
+        background:${color};color:#fff;line-height:16px`;
+      box.appendChild(label);
+      boxContainer.appendChild(box);
+    });
+    boxContainer.style.cssText = `position:absolute;inset:0;pointer-events:none`;
+  };
+  if (img.complete) drawBoxes(); else img.addEventListener('load', drawBoxes);
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  overlay.querySelector('.modal-close').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('[data-act="cancel"]').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('[data-act="apply"]').addEventListener('click', () => {
+    commitResults(node, res.results);
+    renderScreen(nodeIndex.get(CURRENT));
+    overlay.remove();
+  });
 }
 
 async function autolocateCurrent() {
@@ -1789,7 +1878,7 @@ async function autolocateCurrent() {
   const origText = btn.textContent;
   btn.textContent = '识别中…';
   try {
-    const res = await autolocateNode(node);
+    const res = await autolocateNode(node, { dryRun: true });
     if (!res.ok) {
       btn.textContent = '✗ ' + (res.reason === 'no-children' ? '无子页' : res.reason === 'no-image' ? '无截图' : res.reason === 'img-load-fail' ? '图加载失败' : '失败');
       setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
@@ -1797,14 +1886,14 @@ async function autolocateCurrent() {
     }
     const ok = res.results.filter(r => r.status === 'ok').length;
     const total = res.results.length;
-    btn.textContent = `✓ ${ok}/${total}${res.tiles > 1 ? ` · ${res.tiles}块` : ''}`;
-    // 重新渲染当前屏以应用新位置
-    renderScreen(node);
-    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2500);
+    btn.textContent = `${ok}/${total}${res.tiles > 1 ? ` · ${res.tiles}块` : ''} 待确认`;
+    showHotspotCandidates(node, res);
   } catch (e) {
     btn.textContent = '✗ 异常';
     console.error(e);
     setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
+  } finally {
+    setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 3000);
   }
 }
 
