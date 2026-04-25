@@ -68,6 +68,74 @@ npx serve .
 
 ---
 
+## 🤖 AI 识图（OCR + LLM 混合架构）
+
+### 一键启动（推荐）
+
+```bash
+bash scripts/start.sh
+```
+
+会同时起：
+- **静态服务** `:8000` — 提供 Prototype.html
+- **OCR 定位服务** `:8788` — macOS Vision OCR + 智谱 glm-4-flash 语义匹配
+
+自动从 `~/.claude/settings.json` 读取 `ANTHROPIC_AUTH_TOKEN` 作为智谱 key。Ctrl+C 退出时自动清理两个服务。
+
+### 架构说明
+
+```
+浏览器 → POST /ocr-locate (整图 + targets + zhipu_key)
+              ↓
+         localhost:8788 Python (ocr-locate-server.py)
+              ├─ macOS Vision Framework (ocrmac)：分块并行 OCR
+              ├─ 字符串精确匹配：按钮文字场景 100% 命中
+              └─ glm-4-flash 语义匹配：补漏（同义词/跳转描述/文档场景）
+              ↓
+         返回 results (匹配好的 bbox 列表)
+```
+
+**为什么这样设计**：
+- 早期方案直接调智谱视觉模型 `glm-5v-turbo` 做定位，精度低（坐标系混乱）+ 限流严
+- OCR 出文字 + bbox 是计算机视觉强项，比 vision LLM 准得多
+- LLM 在纯文本任务上稳定（不挤 vision 配额），适合做语义匹配
+- 字符串匹配优先让简单场景秒级 + 零成本；LLM 兜底处理复杂场景
+- 未来对接文档输入：把 OCR 替换成 DOM/PDF 解析，匹配层不动
+
+### 性能特性
+
+| 场景 | 耗时 |
+|---|---|
+| 单图 OCR + 匹配（冷启，5 切片并行）| ~8 秒 |
+| 同图重复跑（OCR 缓存命中）| <100 ms |
+| 批量 N 节点 | 串行执行；已手动微调（manual=true）的节点自动跳过 |
+
+### 依赖（一次性）
+
+```bash
+pip3 install --user ocrmac pillow
+```
+
+`ocrmac` 后端是 macOS Vision Framework（系统自带），不需要联网模型，免费。
+
+### 调参
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `ZHIPU_API_KEY` | 从 settings.json 自动读 | 智谱 key |
+| `ZHIPU_MATCH_MODEL` | `glm-4-flash` | 语义匹配模型；可换 `glm-4-plus` 等 |
+| `OCR_PARALLELISM` | `4` | OCR 切片并发上限 |
+
+### 老路径 fallback
+
+OCR 服务没起时，前端**自动回退**到原 `askViaZhipu`（视觉模型直连）路径——见 `Projects/<name>/app.js` 里的 `tryOCRLocate` 函数。这条路径有限流和精度问题，仅作兜底。
+
+### Claude Code Web 环境（云端预览）
+
+如果通过 Claude Code Web 内置预览打开 Prototype.html，会自动注入 `window.claude`，走真 Claude vision 模型识图——这条路径**优先级高于 OCR 服务**。在 Claude Code Web 里使用时无需启动本地 OCR 服务。
+
+---
+
 ## 📋 接下来可以做的事(给新环境的 Claude Code)
 
 按优先级:
