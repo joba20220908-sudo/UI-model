@@ -54,33 +54,42 @@ UI-model/
 
 | 变体 | 特征 | 项目 |
 |---|---|---|
-| **Single-file** | 所有逻辑在 `app.js`（~2000 行）；`<script>` 加载顺序 `data.js → app.js` | `Template/`、`Projects/hnw-licai/`、根目录调试版、`my-new-project/MindDeck-standalone.html` |
-| **Modular** | 拆成 8-9 个 `.js`：`storage.js / tree.js / hotspots.js / comments-ui.js / screen.js / export-ui.js / ai.js / data.js / app.js` | `Projects/my-new-project/`、`Projects/移动端个人高净值用户理财测试样例/` |
+| **Single-file** | `<script>` 加载顺序 `data.js → locator.js → app.js` | `Template/`、`Projects/hnw-licai/`、根目录调试版、`Projects/移动端个人高净值用户理财测试样例/` |
+| **Modular** | 拆成多个 `.js`，加载顺序见下；`ai.js` 负责 `autolocate*`，AI 内部走 `locator.js` | `Projects/my-new-project/` |
+| **Standalone HTML** | 单文件 HTML 内嵌全部脚本（含 locator.js IIFE 副本，保持自包含）| `Projects/my-new-project/MindDeck-standalone.html` |
 
-模块化版本的 `<script>` 加载顺序（在 Prototype.html 里写明）：
+模块化版本的 `<script>` 加载顺序（在 `Projects/my-new-project/Prototype.html` 里）：
 
 ```
 data.js → storage.js → tree.js → hotspots.js → comments-ui.js
-       → screen.js → export-ui.js → ai.js → app.js
+       → screen.js → export-ui.js → locator.js → ai.js → app.js
 ```
 
-`storage.js` 第一个跑，建立全局常量 `TREE` / `META` / `PROJECT_ID` / `LS_PREFIX`，后续模块依赖。
+`storage.js` 第一个跑，建立全局常量 `TREE` / `META` / `PROJECT_ID` / `LS_PREFIX`，后续模块依赖。`locator.js` 必须在 `ai.js` 之前加载（`ai.js#autolocateNode` 调用 `window.locateHotspots`）。
 
-⚠️ **重要陷阱**：模块化项目的 `app.js` 也定义了 `sliceForModel` / `askModelForTile` / `askViaZhipu` / `autolocateNode` 等同名函数，按加载顺序**覆盖** `ai.js` 同名版本。改 `ai.js` 不会单独生效，必须连 `app.js` 一起改。
+### AI Hotspot Localization (Provider Chain)
 
-### AI Hotspot Localization (Three-Tier Fallback)
+所有 AI 定位逻辑集中在 `Template/locator.js`（其他 5 个变体共享同一份 source）。统一入口：
 
-`autolocateNode(node)` 内部分支：
+```js
+window.locateHotspots({ img, targets }) → { candidates, fullW, fullH, source } | null
+```
 
-1. **`tryOCRLocate(img, targets)`**（路径 A，优先）— POST 整图到本地 `localhost:8788/ocr-locate`
+按 `window.LocatorChain` 顺序尝试，第一个返回非空 candidates 的赢：
+
+1. **`ocrServer`** — POST 整图到本地 `localhost:8788/ocr-locate`
    - 服务端：macOS Vision 切片并行 OCR + 图级缓存
    - 服务端匹配：字符串精确匹配命中部分 → 漏掉的交给智谱 `glm-4-flash` 语义补漏
-   - 服务端不可达时返回 `null`，进入路径 B
+   - 服务不可达 / 命中 0 时返回 null，进入下一 provider
 
-2. **vision LLM tiles**（路径 B，兜底）— `sliceForModel` + `askModelForTile`
-   - `askModelForTile` 内嵌套：`window.claude.complete` 存在则用（Claude Code Web 预览注入）；否则走 `askViaZhipu` 直连智谱 `paas/v4/chat/completions`
-   - 含 `[x,y,w,h]` vs `[x1,y1,x2,y2]` 格式探测、零占位过滤、429 指数退避重试
-   - 串行 + `runWithConcurrency(tiles, 1, ...)` 避免并发触发智谱 QPS 限流
+2. **`windowClaude`** — Claude Code Web 预览注入的 `window.claude.complete`（仅云端预览环境）
+   - 走 `sliceForModel` 切片 + 串行调用
+
+3. **`zhipuVision`** — 直连智谱 `glm-5v-turbo`（兜底，限流严）
+   - 内置 429 指数退避重试（4 次，2/4/8/16s）
+   - 含 `[x,y,w,h]` vs `[x1,y1,x2,y2]` 格式探测、零占位过滤
+
+加新 provider（OpenAI / 本地模型）只需在 `locator.js` 里写一个对象 `{name, locate({img, targets, opts})}`，push 到 `LocatorChain` 即可，`autolocateNode` 不用改。
 
 ⚠️ **OCR 服务的 LLM 模型选型**：不能用 reasoning 模型（`glm-4.6` 长 prompt 会被智谱断连 `Remote end closed connection`）。默认 `glm-4-flash`，可通过 `ZHIPU_MATCH_MODEL` 环境变量覆盖。
 
@@ -115,19 +124,31 @@ window.PROTOTYPE_TREE = {
 };
 ```
 
-**`data.js` 怎么生成**：当前无脚本工具（`parse-xmind.js` 未实现）。约定做法：让 Claude 在对话里读 `.xmind` 文件，按 schema 生成 `data.js`，截图手工放进 `screenshots/`，文件名要与 `image` 字段一致。
+**`data.js` 怎么生成**：
+
+```bash
+node scripts/parse-xmind.js <input.xmind> Projects/<new-project> [--id <project-id>]
+```
+
+会读 `.xmind` 内的 `content.json` 生成 `data.js`，并把所有引用的截图从内嵌 `resources/` 抽到 `screenshots/`（用 UUID 文件名，跟 `node.image` 字段对齐）。然后从 `Template/` 复制 `Prototype.html` / `app.js` / `locator.js` 即可打开。
+
+也可以让 Claude 直接在对话里读 `.xmind` 生成 —— 适合需要做 title 清洗、note 提取等手工调整的场景。
 
 ## Common Pitfalls
 
-- **多变体同步**：JS 改动需要同步到所有相关变体（单文件版 4 处 + 模块化版 ai.js × 2 + 模块化版 app.js × 2 + standalone.html）。`Template/` 是 source of truth；新项目时从它复制。Memory 里有"系统性修复原则"专门说这个。
-- **模块化项目里 ai.js 被 app.js 覆盖**：见上文「Two Frontend Variants Coexist」。
+- **多变体同步**：现在 AI 逻辑统一走 `Template/locator.js`，6 个变体都用同一份 source。改 AI 只需要：
+  - 编辑 `Template/locator.js`
+  - `cp` 到所有 5 个外部副本（root、hnw-licai、移动端样例、my-new-project）
+  - 同步内嵌副本：`my-new-project/MindDeck-standalone.html` 里的 IIFE 块
+  - 非 AI 的逻辑改动仍需手工同步到各 `app.js`（Template 是 source of truth）
 - **`scripts/start.sh` 必须 ports 8000 + 8788 都空闲**：脚本会做端口冲突检查并报错；遗留进程用 `lsof -ti :8788 | xargs kill -9` 清。
 - **`scripts/start.sh` 自动从 `~/.claude/settings.json` 读 `ANTHROPIC_AUTH_TOKEN` 当智谱 key**：跨用户使用时要么自己 `export ZHIPU_API_KEY`，要么改脚本。
 - **导入/导出 schema**：`buildExport` / `applyImport` 只接受 JSON 含 `schema: 'minddeck'` 或 `'proto-review'`。
-- **不存在的命令**：曾经的 CLAUDE.md 描述了 `scripts/launch.sh`、`scripts/parse-xmind.js`、`scripts/gen-manifest.js`、`scripts/test-modules.js`、`scripts/verify-images.sh` —— 这些**都未实现**。当前 `scripts/` 只有 `start.sh` / `ocr-locate-server.py` / `vision-proxy.js`。
+- **不存在的命令**：曾经的 CLAUDE.md 描述了 `scripts/launch.sh`、`scripts/gen-manifest.js`、`scripts/test-modules.js`、`scripts/verify-images.sh` —— 这些**都未实现**。当前 `scripts/` 有 `start.sh` / `ocr-locate-server.py` / `parse-xmind.js` / `vision-proxy.js`。
 
 ## Reference Docs
 
 - [`README.md`](README.md) — 项目顶层介绍 + 仓库结构
+- [`USAGE.md`](USAGE.md) — 端到端使用流程（输入 → 启动 → 评审 → 导出）
 - [`Template/README.md`](Template/README.md) — 工具本体完整使用文档（schema、快捷键、协作流程）
 - [`MIGRATION.md`](MIGRATION.md) — 搬家指南 + AI 识图本地运行（OCR + LLM 架构详解、依赖、环境变量、性能特性）
