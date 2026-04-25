@@ -1594,7 +1594,7 @@ async function loadImage(url) {
 
 // 把整图切成 tile。返回 [{b64, sx, sy, sw, sh, tileW, tileH}, ...]
 // sx/sy/sw/sh 是该 tile 对应**原图**的区域;tileW/tileH 是 tile 实际像素(喂给模型的)
-async function sliceForModel(img, { targetW = 600, tileH = 900, overlap = 120 } = {}) {
+async function sliceForModel(img, { targetW = 900, tileH = 900, overlap = 300 } = {}) {
   const scale = Math.min(1, targetW / img.naturalWidth);
   const fullW = Math.round(img.naturalWidth * scale);
   const fullH = Math.round(img.naturalHeight * scale);
@@ -1647,37 +1647,113 @@ function extractJsonArray(text) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-async function askViaAnthropicApi(tile, prompt) {
-  let apiKey = localStorage.getItem('minddeck:anthropic_key');
+// 本地浏览器环境下（window.claude 不存在时）走智谱 glm-5v-turbo 视觉模型
+// OpenAI 兼容端点，不是 Anthropic 兼容层（后者不支持多模态视觉）
+async function askViaZhipu(tile, prompt) {
+  let apiKey = localStorage.getItem('minddeck:zhipu_key');
   if (!apiKey) {
-    apiKey = window.prompt('请输入 Anthropic API Key（只存在本地 localStorage，不会上传）：');
+    apiKey = window.prompt('请输入智谱 API Key（只存在本地 localStorage，不会上传）：');
     if (!apiKey) throw new Error('未提供 API Key');
-    localStorage.setItem('minddeck:anthropic_key', apiKey.trim());
+    localStorage.setItem('minddeck:zhipu_key', apiKey.trim());
   }
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+  const resp = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': apiKey.trim(),
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true'
+      'Authorization': `Bearer ${apiKey.trim()}`
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
+      model: 'glm-5v-turbo',
       messages: [{ role: 'user', content: [
-        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: tile.b64 } },
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${tile.b64}` } },
         { type: 'text', text: prompt }
       ]}]
     })
   });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
-    if (resp.status === 401) localStorage.removeItem('minddeck:anthropic_key');
-    throw new Error(`Anthropic API ${resp.status}: ${err.error?.message || resp.statusText}`);
+    if (resp.status === 401) localStorage.removeItem('minddeck:zhipu_key');
+    throw new Error(`Zhipu API ${resp.status}: ${err.error?.message || resp.statusText}`);
   }
   const data = await resp.json();
-  return data.content[0].text;
+  return data.choices?.[0]?.message?.content || '';
+}
+
+// ============================================================
+// OCR + LLM 语义匹配定位（服务端架构）
+// 流程：
+//   1. 浏览器把整图 + targets + zhipu_key POST 到 localhost:8788/ocr-locate
+//   2. Python 服务做 OCR + 调智谱 glm-4.6 做语义匹配（不在浏览器里调外网）
+//   3. 服务返回最终 results；前端只负责按 results 拼 candidates
+// 为何 LLM 调用在服务端：
+//   - 浏览器直连 open.bigmodel.cn 经常 ERR_CONNECTION_CLOSED（CORS/SNI/限流断连）
+//   - 服务端 urllib 无 CORS 烦恼，更稳
+//   - 未来对接文档输入时，把 ocr_items 替换成 doc_elements，匹配层不动
+// ============================================================
+const OCR_LOCATE_URL = 'http://localhost:8788/ocr-locate';
+
+async function tryOCRLocate(img, targets) {
+  // 整图转 base64
+  let b64;
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext('2d').drawImage(img, 0, 0);
+    b64 = canvas.toDataURL('image/png').split(',')[1];
+  } catch (e) {
+    console.warn('[OCR] 图片转 base64 失败:', e.message);
+    return null;
+  }
+  // 把 zhipu_key 一起发给本地服务，由它转发到智谱（服务端无 CORS 问题）
+  const zhipuKey = localStorage.getItem('minddeck:zhipu_key') || '';
+  let resp;
+  try {
+    resp = await fetch(OCR_LOCATE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_b64: b64, targets, zhipu_key: zhipuKey })
+    });
+  } catch (e) {
+    console.info('[OCR] 本地服务未启动（' + OCR_LOCATE_URL + '），将回退到 vision LLM。要启用 OCR 路径，跑：python3 scripts/ocr-locate-server.py');
+    return null;
+  }
+  if (!resp.ok) { console.warn('[OCR] 服务返回 ' + resp.status); return null; }
+  const data = await resp.json().catch(() => null);
+  if (!data || !data.ok) return null;
+
+  const matchSource = data.match_source || 'unknown';
+  console.info(`[OCR] ${(data.ocr_items || []).length} 条文本，匹配方式: ${matchSource}，fullSize ${data.fullW}×${data.fullH}`);
+
+  const candidates = {};
+  let hits = 0, miss = 0;
+  for (const r of (data.results || [])) {
+    if (r.status !== 'ok' || !r.bbox) { miss++; continue; }
+    const [x, y, w, h] = r.bbox;
+    if (w <= 0 || h <= 0) { miss++; continue; }
+    (candidates[r.label] = candidates[r.label] || []).push({
+      xInFull: x, yInFull: y, w, h, conf: r.confidence || 1.0
+    });
+    hits++;
+  }
+  console.info(`[OCR/${matchSource}] ${hits}/${targets.length} 命中（miss ${miss}）`);
+  return { candidates, fullW: data.fullW, fullH: data.fullH };
+}
+
+// 限并发 map：避免触发智谱 QPS 限流（429）
+async function runWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 async function askModelForTile(tile, targets) {
@@ -1710,7 +1786,7 @@ ${targets.map((t, i) => `${i + 1}. "${t}"`).join('\n')}
         ]}]
       });
     } else {
-      raw = await askViaAnthropicApi(tile, prompt);
+      raw = await askViaZhipu(tile, prompt);
     }
   } catch (e) {
     return { ok: false, error: e.message };
@@ -1729,30 +1805,54 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003, dryRun = false
   try { img = await loadImage(url); }
   catch (e) { return { ok: false, reason: 'img-load-fail' }; }
 
-  const tiles = await sliceForModel(img);
-  const fullW = tiles[0].fullW, fullH = tiles[0].fullH;
   const targets = kids.map(k => k.title);
+  let candidates = null, fullW, fullH, tilesCount = 1, source = 'ocr';
 
-  // 每块一次模型调用;收集全部候选
-  // 结构: { label: [{xInFull, yInFull, w, h, conf}, ...] }
-  const candidates = {};
-  for (const tile of tiles) {
-    const res = await askModelForTile(tile, targets);
-    if (!res.ok) continue;
-    for (const item of res.arr) {
-      if (!item || !Array.isArray(item.bbox) || item.bbox.length !== 4) continue;
-      const label = item.label;
-      const conf = Number(item.confidence) || 0;
-      const [x, y, w, h] = item.bbox.map(Number);
-      if (![x, y, w, h].every(Number.isFinite)) continue;
-      if (w <= 0 || h <= 0) continue;
-      // 忽略明显占满切片的无意义框
-      if (w >= tile.tileW * 0.98 && h >= tile.tileH * 0.98) continue;
-      (candidates[label] = candidates[label] || []).push({
-        xInFull: x,
-        yInFull: y + tile.offsetYInFull,
-        w, h, conf
-      });
+  // 路径 A：优先尝试本地 OCR 服务（精确、免费、无限流）
+  const ocrResult = await tryOCRLocate(img, targets);
+  if (ocrResult) {
+    candidates = ocrResult.candidates;
+    fullW = ocrResult.fullW;
+    fullH = ocrResult.fullH;
+  }
+
+  // 路径 B：OCR 不可用时回退到 vision LLM 切片路径
+  if (!candidates) {
+    source = 'llm';
+    const tiles = await sliceForModel(img);
+    tilesCount = tiles.length;
+    fullW = tiles[0].fullW;
+    fullH = tiles[0].fullH;
+    candidates = {};
+    // 智谱限流严格，串行 + 429 自动退避重试（精度优先于速度）
+    const tileResults = await runWithConcurrency(tiles, 1, tile => askModelForTile(tile, targets).then(res => ({ tile, res })));
+    for (const { tile, res } of tileResults) {
+      if (!res.ok) continue;
+      for (const item of res.arr) {
+        if (!item || !Array.isArray(item.bbox) || item.bbox.length !== 4) continue;
+        const label = item.label;
+        const conf = Number(item.confidence) || 0;
+        // 过滤零占位（模型对未识别目标硬塞的 [0,0,0,0]）
+        if (conf <= 0) continue;
+        let [a, b, c, d] = item.bbox.map(Number);
+        if (![a, b, c, d].every(Number.isFinite)) continue;
+        if (a === 0 && b === 0 && c === 0 && d === 0) continue;
+        // 探测 bbox 格式：[x,y,w,h] 还是 [x1,y1,x2,y2]
+        let x = a, y = b, w = c, h = d;
+        const exceedsAsXYWH = (a + c) > tile.tileW * 1.1 || (b + d) > tile.tileH * 1.1;
+        const validAsXYXY = c > a && d > b && (c - a) > 0 && (d - b) > 0 && (c - a) < tile.tileW && (d - b) < tile.tileH;
+        if (exceedsAsXYWH && validAsXYXY) {
+          w = c - a;
+          h = d - b;
+        }
+        if (w <= 0 || h <= 0) continue;
+        if (w >= tile.tileW * 0.98 && h >= tile.tileH * 0.98) continue;
+        (candidates[label] = candidates[label] || []).push({
+          xInFull: x,
+          yInFull: y + tile.offsetYInFull,
+          w, h, conf
+        });
+      }
     }
   }
 
@@ -1813,7 +1913,7 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003, dryRun = false
     ok.forEach(r => saveHotspotPosition(node.uid, r.uid, { ...r.pos, conf: r.conf, manual: false }));
   }
 
-  return { ok: true, results, tiles: tiles.length, imageUrl: url, fullW, fullH };
+  return { ok: true, results, tiles: tilesCount, source, imageUrl: url, fullW, fullH };
 }
 
 function commitResults(parentNode, results) {
@@ -1939,15 +2039,27 @@ async function autolocateAll() {
   const btn = document.getElementById('btn-autolocate-all');
   const allBtn = btn;
   // 收集候选
-  const candidates = [];
+  const allCandidates = [];
   (function walk(n) {
     if (nodeHasImage(n) && n.children.some(c => nodeHasImage(c) || c.children.length > 0)) {
-      candidates.push(n);
+      allCandidates.push(n);
     }
     n.children.forEach(walk);
   })(TREE);
 
-  const confirm = window.confirm(`将对 ${candidates.length} 个父页面批量调用 AI 识别热点(约需 ${candidates.length * 3} 秒)。确认继续?`);
+  // 过滤：跳过所有子节点都已 manual=true 微调的父节点（保护用户手工结果，避免重复跑 OCR）
+  const hsAll = loadHotspotPositions();
+  const candidates = allCandidates.filter(n => {
+    const kids = n.children.filter(c => nodeHasImage(c) || c.children.length > 0);
+    if (!kids.length) return false;
+    const parentHs = hsAll[n.uid] || {};
+    const allManual = kids.every(k => parentHs[k.uid]?.manual === true);
+    return !allManual;
+  });
+  const skipped = allCandidates.length - candidates.length;
+
+  const skipMsg = skipped > 0 ? `（跳过 ${skipped} 个已手动微调完成的节点）` : '';
+  const confirm = window.confirm(`将对 ${candidates.length} 个父页面批量调用 AI 识别热点${skipMsg}\n约需 ${candidates.length * 3} 秒。确认继续?`);
   if (!confirm) return;
 
   allBtn.disabled = true;
