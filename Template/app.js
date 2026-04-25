@@ -1647,6 +1647,39 @@ function extractJsonArray(text) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
+async function askViaAnthropicApi(tile, prompt) {
+  let apiKey = localStorage.getItem('minddeck:anthropic_key');
+  if (!apiKey) {
+    apiKey = window.prompt('请输入 Anthropic API Key（只存在本地 localStorage，不会上传）：');
+    if (!apiKey) throw new Error('未提供 API Key');
+    localStorage.setItem('minddeck:anthropic_key', apiKey.trim());
+  }
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey.trim(),
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: tile.b64 } },
+        { type: 'text', text: prompt }
+      ]}]
+    })
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    if (resp.status === 401) localStorage.removeItem('minddeck:anthropic_key');
+    throw new Error(`Anthropic API ${resp.status}: ${err.error?.message || resp.statusText}`);
+  }
+  const data = await resp.json();
+  return data.content[0].text;
+}
+
 async function askModelForTile(tile, targets) {
   const prompt = `这是一张移动端 APP 截图的一部分,尺寸 ${tile.tileW}×${tile.tileH} 像素(坐标原点在本切片左上角)。
 
@@ -1669,15 +1702,16 @@ ${targets.map((t, i) => `${i + 1}. "${t}"`).join('\n')}
 
   let raw;
   try {
-    raw = await window.claude.complete({
-      messages: [{
-        role: 'user',
-        content: [
+    if (typeof window.claude !== 'undefined') {
+      raw = await window.claude.complete({
+        messages: [{ role: 'user', content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: tile.b64 } },
           { type: 'text', text: prompt }
-        ]
-      }]
-    });
+        ]}]
+      });
+    } else {
+      raw = await askViaAnthropicApi(tile, prompt);
+    }
   } catch (e) {
     return { ok: false, error: e.message };
   }
