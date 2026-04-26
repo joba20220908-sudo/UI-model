@@ -105,34 +105,74 @@ window.locateHotspots({ img, targets }) → { candidates, fullW, fullH, source }
   - `proto:<id>:comments_v1` — 评论
   - `proto:<id>:hs_positions_v1` — 热点位置
   - `proto:<id>:img_overrides_v1` — 截图替换 metadata
+  - `proto:<id>:tree_overrides_v1` — 树层级覆盖（手动调整：移动 / 新增 / 删除）
   - 用户输入的智谱 key：`minddeck:zhipu_key`（前端 fallback 路径用，全局 key）
 - **IndexedDB** per-project：库名 `proto_imgs__<id>`，store `blobs` 存截图 Blob
 - 多项目通过 `PROJECT_ID = META.id` 前缀完全隔离
+
+### Tree Overrides（用户手动调整树形）
+
+`tree_overrides_v1` 在 boot 时被读取并 mutate `TREE`（在 `app.js` / 模块化版 `storage.js` 顶部的 IIFE）：
+
+```js
+{
+  moves: { uid: newParentUid|null },     // 拖拽 re-parent；null = 挂根
+  adds: [{ uid: 'c_xxx', parentUid, title, image }],  // 用户新增
+  deletes: [uid, ...]                    // 用户删除（含子树）
+}
+```
+
+**Apply 顺序**：`adds` → `moves` → `deletes`。这个顺序保证"删除节点 X 但保留子孙"语义正确（先把 X 的 kids 用 moves 挪走、再 delete X）。
+
+UI 入口：
+- 拖拽 `.tree-item` 触发 `moves`
+- 节点 hover 显示 `+ ×` 按钮触发 `adds` / `deletes`
+- 工具栏「+ 热点」进入画框模式，框选 + 命名 → 同时 `adds` 子节点 + 写 `hs_positions`
+- 热点 hover 显示红色 ×，删除 = `deletes`（带 3 选 1 对话框：取消 / 仅删本节点子孙上挂 / 整棵删）
+
+兼容旧扁平格式 `{uid: parentUid}`：自动迁移到 `moves`。
 
 ### `data.js` Schema
 
 ```js
 window.PROJECT_META = { id: string, title: string, sub: string|null };
 window.PROTOTYPE_TREE = {
-  uid: 'n0',          // sequential pre-order: n0, n1, n2...
+  uid: 'n0',                  // sequential pre-order: n0, n1, n2...
   depth: 0,
-  title: string,      // rawTitle with \n → space
-  rawTitle: string,   // original XMind title
+  title: string,              // rawTitle with \n → space
+  rawTitle: string,           // original title (XMind / Word heading)
   note: string|null,
-  image: string|null, // filename only, e.g. "abc123.png" → screenshots/abc123.png?v2
+  image: string|null,         // filename only, e.g. "abc123.png" → screenshots/abc123.png?v2
+  description: string|null,   // Word 路径填充：H3 段落 + 列表项（• 前缀）
+  tables: array|null,         // Word 路径填充：[{headers:[], rows:[[]]}]
+  nav_targets: array|null,    // Word 路径 LLM 抽取：[{label, trigger, uid?}]
   children: [...]
 };
 ```
 
+`description` / `tables` / `nav_targets` 在 xmind 路径下永远为 `null`，前端短路渲染。
+
 **`data.js` 怎么生成**：
 
+XMind 输入：
 ```bash
-node scripts/parse-xmind.js <input.xmind> Projects/<new-project> [--id <project-id>]
+node scripts/parse-xmind.js <input.xmind> Projects/<new-project> [--id <id>]
 ```
 
-会读 `.xmind` 内的 `content.json` 生成 `data.js`，并把所有引用的截图从内嵌 `resources/` 抽到 `screenshots/`（用 UUID 文件名，跟 `node.image` 字段对齐）。然后从 `Template/` 复制 `Prototype.html` / `app.js` / `locator.js` 即可打开。
+Word PRD 输入：
+```bash
+python3 scripts/parse-docx.py <input.docx> Projects/<new-project> [--id <id>] [--entry "APP首页"] [--no-llm]
+```
 
-也可以让 Claude 直接在对话里读 `.xmind` 生成 —— 适合需要做 title 清洗、note 提取等手工调整的场景。
+- `--entry "<H2 标题>"` 启用 LLM 重构：调智谱 `glm-4-flash` 扫每个 H3 描述里的"进入 X / 跳到 X"语句，把被引用的 H2 整体挂到对应 H3 下。被引用的目标也会写入 `nav_targets`。
+- `--no-llm` 跳过 LLM 步骤，仅按 doc 标题层级输出
+- ZHIPU_API_KEY 优先环境变量，其次 `~/.claude/settings.json` 里的 `ANTHROPIC_AUTH_TOKEN`
+
+依赖（一次性）：`pip3 install --user python-docx`
+
+两条解析器都把截图（xmind 的 `resources/<uuid>.png` 或 docx 的 `word/media/`）抽到 `screenshots/`，按内容 sha1 / uuid 命名去重。然后从 `Template/` 复制 `Prototype.html` / `app.js` / `locator.js` 即可打开。
+
+也可以让 Claude 直接在对话里读源文件生成 `data.js` —— 适合需要做 title 清洗、note 提取等手工调整的场景。
 
 ## Common Pitfalls
 
@@ -144,7 +184,8 @@ node scripts/parse-xmind.js <input.xmind> Projects/<new-project> [--id <project-
 - **`scripts/start.sh` 必须 ports 8000 + 8788 都空闲**：脚本会做端口冲突检查并报错；遗留进程用 `lsof -ti :8788 | xargs kill -9` 清。
 - **`scripts/start.sh` 自动从 `~/.claude/settings.json` 读 `ANTHROPIC_AUTH_TOKEN` 当智谱 key**：跨用户使用时要么自己 `export ZHIPU_API_KEY`，要么改脚本。
 - **导入/导出 schema**：`buildExport` / `applyImport` 只接受 JSON 含 `schema: 'minddeck'` 或 `'proto-review'`。
-- **不存在的命令**：曾经的 CLAUDE.md 描述了 `scripts/launch.sh`、`scripts/gen-manifest.js`、`scripts/test-modules.js`、`scripts/verify-images.sh` —— 这些**都未实现**。当前 `scripts/` 有 `start.sh` / `ocr-locate-server.py` / `parse-xmind.js` / `vision-proxy.js`。
+- **不存在的命令**：曾经的 CLAUDE.md 描述了 `scripts/launch.sh`、`scripts/gen-manifest.js`、`scripts/test-modules.js`、`scripts/verify-images.sh` —— 这些**都未实现**。当前 `scripts/` 有 `start.sh` / `ocr-locate-server.py` / `parse-xmind.js` / `parse-docx.py` / `vision-proxy.js`。
+- **`MindDeck-standalone.html` 跟主线脱节**：内嵌的 app.js / locator.js 是早期快照副本，新加的 tree overrides / 拖拽 / 节点编辑 / 热点编辑都没同步进去。需要时从 `Template/app.js` 重新拷贝整段，或干脆当成只读样本。
 
 ## Reference Docs
 

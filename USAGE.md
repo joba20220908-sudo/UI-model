@@ -10,10 +10,11 @@
 
 | 输入 | 说明 |
 |---|---|
-| `.xmind` 文件 | 产品功能脑图，每个节点对应一屏 |
-| 截图若干张 | PNG/JPG，每张对应脑图里**有截图的节点**（叶子或中间节点都行） |
+| `.xmind` 或 `.docx` | 产品脑图（每节点一屏）或 Word PRD（含截图、需求描述、跳转描述） |
+| 截图若干张 | xmind / docx 内嵌的会自动抽出；若手工补图，PNG/JPG 都行 |
 | macOS（可选） | 想用本地 AI 自动定位热点需要 macOS（依赖系统 Vision Framework）；只点点评论可跳过 |
-| 智谱 API Key（可选） | AI 语义匹配用，没有也能跑（仅字符串匹配） |
+| 智谱 API Key（可选） | AI 语义匹配 + Word 路径 LLM 重构层级用，没有也能跑（仅字符串匹配 / 跳过重构） |
+| `python-docx`（可选） | Word 输入路径需要：`pip3 install --user python-docx` |
 
 **输出**：一个浏览器里能打开的交互式原型，可以打针评论、追未解决项、导出 JSON 给同事接力。
 
@@ -80,36 +81,50 @@ http://localhost:8000/Projects/移动端个人高净值用户理财测试样例/
 cp -r Template/ Projects/my-new-project/
 ```
 
-### 4.2 让 Claude 解析 XMind 生成 `data.js`
+### 4.2 解析输入文件生成 `data.js`
 
-当前没有 CLI 解析脚本（`scripts/parse-xmind.js` 未实现）。约定做法：
+支持两种输入：**XMind 脑图** 或 **Word PRD 文档**。
 
-> 把 `.xmind` 文件丢给 Claude 对话，告诉它：
-> - 解压并读 `content.json`
-> - 按 [`Template/README.md`](Template/README.md#数据结构) 里的 schema 生成 `Projects/my-new-project/data.js`
-> - 列出所需截图清单（每个 `node.image` 字段对应一个文件名）
+#### A. XMind 输入
 
-生成后 `data.js` 大致长这样：
-
-```js
-window.PROJECT_META = {
-  id: 'my-new-project',  // 小写英文+短横，全局唯一（本地存储靠它隔离）
-  title: '我的评审项目',
-  sub: null              // null = 自动统计节点数/截图数
-};
-window.PROTOTYPE_TREE = {
-  uid: 'n0', depth: 0,
-  title: '首页',
-  rawTitle: '首页',
-  note: null,
-  image: 'home.png',     // 文件名要和 screenshots/ 里实际文件一致
-  children: [ /* ... */ ]
-};
+```bash
+node scripts/parse-xmind.js path/to/spec.xmind Projects/my-new-project --id my-new-project
 ```
 
-### 4.3 把截图放进去
+自动解析 `content.json` 层级 + 把 `resources/` 里的截图抽到 `screenshots/`。
 
-所有截图扔到 `Projects/my-new-project/screenshots/`，**文件名必须和 `node.image` 字段完全一致**。
+#### B. Word PRD 输入
+
+```bash
+# 一次性依赖
+pip3 install --user python-docx
+
+# 解析（含 LLM 智能重构层级，需要智谱 key）
+python3 scripts/parse-docx.py path/to/spec.docx Projects/my-new-project \
+  --id my-new-project --entry "APP首页"
+```
+
+参数：
+- `--entry "<H2 标题>"`：显式指定入口页（如 "APP首页"）。开启后调智谱 `glm-4-flash` 扫每个 H3 描述里的"点击金刚区进入 X"之类语句，把被引用的 H2 自动挂到对应 H3 下，形成真实导航树（而不是 doc 原本按模块分类的扁平结构）
+- `--no-llm`：跳过 LLM 重构，纯按 doc 标题层级输出
+- ZHIPU_API_KEY 来源：环境变量优先，其次自动读 `~/.claude/settings.json` 的 `ANTHROPIC_AUTH_TOKEN`
+
+Word 路径会比 xmind 多产出三个字段：
+- `description`：H3 段落正文 + 列表项（多张图也会列在这里）
+- `tables`：H3 下的表格（结构化保留）
+- `nav_targets`：LLM 抽取的跳转目标 chip（点击直接跳到目标节点）
+
+#### C. 让 Claude 在对话里手写 `data.js`
+
+适合 docx/xmind 都没有、或者源文件结构混乱需要清洗的场景。把源文件丢给 Claude，按 schema 让它生成。
+
+### 4.3 复制模板文件
+
+解析完只生成了 `data.js` + `screenshots/`。还要从 `Template/` 拷贝 UI 文件：
+
+```bash
+cp Template/Prototype.html Template/app.js Template/locator.js Projects/my-new-project/
+```
 
 ### 4.4 打开浏览器
 
@@ -169,6 +184,28 @@ http://localhost:8000/Projects/my-new-project/Prototype.html
 ### 5.5 替换截图
 
 直接把新图**拖拽**到手机框上 —— 覆盖当前节点的截图。原图随时可一键切回对比。
+
+### 5.6 手动调整树形（拖拽 / 新增 / 删除）
+
+解析器（尤其是 Word 路径）输出的层级未必准，浏览器里可以现场调：
+
+- **拖拽 re-parent**：左侧树拖动节点到目标节点，松手后挂到目标下；不能挂自己后代（防环）
+- **新增子节点**：hover 树节点 → 右侧 `+` 按钮 → 输入标题 → 立即出现在树里（无截图、无热点）
+- **删除节点**：hover 树节点 → 右侧 `×` 按钮
+  - 节点无子孙：直接确认删
+  - 节点有子孙：弹 3 选 1 对话框
+    - **仅删本节点**（子孙上挂到父级）
+    - **整棵子树删除**
+    - 取消
+- **重置全部调整**：左侧树顶部出现 `↺ 重置` 横幅时点击，所有手动调整还原
+
+所有调整存 localStorage 的 `proto:<id>:tree_overrides_v1`，刷新页面保留，**不会改 `data.js`**。
+
+### 5.7 手动管理热点
+
+- **新增热点**：工具栏点 `+ 热点` → 鼠标变十字 → 在截图上拖一个矩形 → 输入新页面标题 → 自动建子节点 + 设位置（标记 `manual: true`，不会被 AI 重定位覆盖）
+- **删除热点**：hover 任意热点 → 右上角红色 `×` → 弹 3 选 1（同上节点删除逻辑）
+- 取消画框模式：按 `Esc`
 
 ---
 
