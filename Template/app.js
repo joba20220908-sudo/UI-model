@@ -364,6 +364,7 @@ async function buildExport({ includeImages }) {
     comments: loadComments(),
     hotspots: loadHotspotPositions(),
     imgOverridesMeta: loadImgOverrides(), // {uid: {blobKey, mime, fileName, addedAt, replaced}}
+    review: loadReview(),                 // {uid: {conclusion, updatedAt, updatedBy}}
     current: CURRENT,
     images: {}  // blobKey -> { mime, base64 }  仅 includeImages=true 时填充
   };
@@ -428,6 +429,20 @@ async function applyImport(data, strategy) {
   }
   saveComments(merged);
 
+  // 1.5 评审结论（按 uid 合并）
+  const curRev = loadReview();
+  const incRev = data.review || {};
+  let mergedRev;
+  if (strategy === 'replace') {
+    mergedRev = incRev;
+  } else if (strategy === 'merge-overwrite') {
+    mergedRev = { ...curRev, ...incRev };
+  } else {
+    mergedRev = { ...curRev };
+    for (const uid in incRev) if (!mergedRev[uid]) mergedRev[uid] = incRev[uid];
+  }
+  saveReview(mergedRev);
+
   // 2. 热点位置(按 parentUid → childUid 嵌套)
   const curHs = loadHotspotPositions();
   const incHs = data.hotspots || {};
@@ -488,6 +503,7 @@ async function applyImport(data, strategy) {
     comments: Object.values(merged).reduce((n, arr) => n + arr.length, 0),
     hotspots: Object.values(mergedHs).reduce((n, o) => n + Object.keys(o||{}).length, 0),
     images: data.includeImages ? Object.keys(data.images||{}).length : 0,
+    review: Object.keys(mergedRev || {}).length,
   };
 }
 
@@ -612,6 +628,63 @@ function countOpenComments() {
 }
 function nodeHasOpenComments(uid) {
   return getNodeComments(uid).some(c => c.status === 'open');
+}
+// 评论 kind：'comment'（默认） | 'todo'（待确认事项）
+function commentKind(c) { return (c && c.kind) || 'comment'; }
+function getNodeTodos(uid) {
+  return getNodeComments(uid).filter(c => commentKind(c) === 'todo');
+}
+function getNodeFreeComments(uid) {
+  return getNodeComments(uid).filter(c => commentKind(c) === 'comment');
+}
+
+// ===== 评审结论（per-node 整页结论） =====
+// 结构：{ [uid]: { conclusion, updatedAt, updatedBy } }
+const REVIEW_KEY = LS_PREFIX + 'review_v1';
+function loadReview() {
+  try { return JSON.parse(localStorage.getItem(REVIEW_KEY) || '{}'); }
+  catch { return {}; }
+}
+function saveReview(data) {
+  localStorage.setItem(REVIEW_KEY, JSON.stringify(data || {}));
+}
+function getNodeReview(uid) {
+  return loadReview()[uid] || null;
+}
+function setNodeReview(uid, conclusion, source) {
+  const all = loadReview();
+  const text = String(conclusion || '').trim();
+  if (!text) {
+    delete all[uid];
+  } else {
+    all[uid] = {
+      conclusion: text,
+      updatedAt: Date.now(),
+      updatedBy: source || 'manual',
+    };
+  }
+  saveReview(all);
+}
+function countReviewStats() {
+  const r = loadReview();
+  const all = loadComments();
+  let openTodos = 0, resolvedTodos = 0, totalComments = 0;
+  for (const uid in all) {
+    for (const c of (all[uid] || [])) {
+      if (commentKind(c) === 'todo') {
+        if (c.status === 'resolved') resolvedTodos++;
+        else openTodos++;
+      } else {
+        totalComments++;
+      }
+    }
+  }
+  return {
+    pages: Object.keys(r).length,
+    conclusions: Object.keys(r).length,
+    openTodos, resolvedTodos,
+    comments: totalComments,
+  };
 }
 
 // ===== 大纲树渲染 =====
@@ -929,6 +1002,10 @@ function openCommentComposer(wrap, node, xPct, yPct, anchorPxX, anchorPxY) {
       <span class="pop-title">新增评论</span>
       <span class="pop-drag-hint">拖动移动</span>
     </div>
+    <div class="kind-tabs" style="display:flex;gap:4px;margin:4px 0 8px">
+      <button type="button" class="kind-tab active" data-kind="comment" style="flex:1;padding:4px 8px;font-size:11px;border:1px solid var(--accent-dim);background:color-mix(in oklch,var(--accent) 18%,var(--bg-2));color:var(--fg);border-radius:4px;cursor:pointer">💬 评论</button>
+      <button type="button" class="kind-tab" data-kind="todo" style="flex:1;padding:4px 8px;font-size:11px;border:1px solid var(--line);background:var(--bg-2);color:var(--fg-dim);border-radius:4px;cursor:pointer">✅ 待确认事项</button>
+    </div>
     <textarea placeholder="写一条评论… (Cmd/Ctrl+Enter 保存)" rows="3"></textarea>
     <div class="popover-btns">
       <button class="pv-btn ghost" data-act="cancel">取消</button>
@@ -938,18 +1015,32 @@ function openCommentComposer(wrap, node, xPct, yPct, anchorPxX, anchorPxY) {
   document.body.appendChild(pop);
   positionPopover(pop, anchorPxX, anchorPxY);
   makeDraggable(pop, pop.querySelector('.pop-head'));
-  // 兜底:拦截可能触发"点击外部关闭"的事件
-  // 注意:mouseup/pointerup 不能拦,否则拖拽释放收不到
   ['mousedown','click','pointerdown'].forEach(ev => {
     pop.addEventListener(ev, e => e.stopPropagation());
   });
   const ta = pop.querySelector('textarea');
   ta.focus();
+  // kind 切换
+  let kind = 'comment';
+  pop.querySelectorAll('.kind-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      kind = tab.dataset.kind;
+      pop.querySelectorAll('.kind-tab').forEach(t => {
+        const active = t.dataset.kind === kind;
+        t.classList.toggle('active', active);
+        t.style.borderColor = active ? 'var(--accent-dim)' : 'var(--line)';
+        t.style.background = active ? 'color-mix(in oklch,var(--accent) 18%,var(--bg-2))' : 'var(--bg-2)';
+        t.style.color = active ? 'var(--fg)' : 'var(--fg-dim)';
+      });
+      ta.placeholder = kind === 'todo' ? '描述待确认事项 (Cmd/Ctrl+Enter 保存)' : '写一条评论… (Cmd/Ctrl+Enter 保存)';
+    });
+  });
   pop.querySelector('[data-act="cancel"]').addEventListener('click', () => pop.remove());
   pop.querySelector('[data-act="save"]').addEventListener('click', () => {
     const text = ta.value.trim();
     if (!text) { ta.focus(); return; }
-    addComment(node.uid, xPct, yPct, text);
+    const c = addComment(node.uid, xPct, yPct, text);
+    if (kind === 'todo') updateComment(node.uid, c.id, { kind: 'todo' });
     pop.remove();
     renderScreen(node);
     renderInspector(node);
@@ -1668,8 +1759,85 @@ function renderInspector(node) {
     body.appendChild(sec);
   }
 
-  // 评论列表
-  const comments = getNodeComments(node.uid);
+  // ===== 评审结论（per-node 整页结论）=====
+  {
+    const review = getNodeReview(node.uid);
+    const sec = document.createElement('div');
+    sec.className = 'ins-section';
+    sec.innerHTML = `
+      <div class="ins-label">评审结论 <span class="tag" style="background:color-mix(in oklch,var(--accent) 18%,transparent);border-color:var(--accent-dim);color:var(--fg)">REVIEW</span></div>
+      <textarea class="review-conclusion" rows="3" placeholder="本页评审结论 / 决议… (Cmd/Ctrl+Enter 保存)" style="width:100%;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;color:var(--fg);font-size:12px;padding:6px 8px;resize:vertical;font-family:inherit;line-height:1.5"></textarea>
+      <div class="review-meta" style="margin-top:4px;font-size:10px;color:var(--fg-mute);display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <span class="review-status">${review ? `${review.updatedBy === 'import' ? '🤖 ' : ''}更新于 ${new Date(review.updatedAt).toLocaleString('zh-CN')}` : '尚未填写'}</span>
+        <span class="review-hint" style="opacity:0.7"></span>
+      </div>
+    `;
+    body.appendChild(sec);
+    const ta = sec.querySelector('.review-conclusion');
+    const status = sec.querySelector('.review-status');
+    const hint = sec.querySelector('.review-hint');
+    ta.value = review ? review.conclusion : '';
+    let saveTimer;
+    const persist = () => {
+      const text = ta.value.trim();
+      const before = review ? review.conclusion : '';
+      if (text === before) return;
+      setNodeReview(node.uid, text, 'manual');
+      const now = getNodeReview(node.uid);
+      status.textContent = now ? `更新于 ${new Date(now.updatedAt).toLocaleString('zh-CN')}` : '尚未填写';
+      hint.textContent = '已保存 ✓';
+      setTimeout(() => { hint.textContent = ''; }, 1200);
+    };
+    ta.addEventListener('blur', persist);
+    ta.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        ta.blur();
+      }
+    });
+    ta.addEventListener('input', () => {
+      hint.textContent = '编辑中…';
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(persist, 1500);
+    });
+  }
+
+  // ===== 待确认事项（kind = todo）=====
+  const todos = getNodeTodos(node.uid);
+  if (todos.length) {
+    const sec = document.createElement('div');
+    sec.className = 'ins-section';
+    const openTodo = todos.filter(c => c.status === 'open').length;
+    sec.innerHTML = `<div class="ins-label">待确认事项 · ${todos.length}${openTodo ? ` <span class="tag" style="background:#7a3a00;border-color:#a55;color:#fdc">${openTodo} 待解决</span>` : ` <span class="tag">全部已解决</span>`}</div>`;
+    const list = document.createElement('div');
+    list.className = 'cmt-list';
+    todos.forEach((c, i) => {
+      const row = document.createElement('div');
+      row.className = 'cmt-row' + (c.status === 'resolved' ? ' resolved' : '');
+      row.innerHTML = `
+        <span class="cmt-num">${c.status === 'resolved' ? '✓' : '○'}</span>
+        <div class="cmt-body">
+          <div class="cmt-text">${escapeHtml(c.text)}</div>
+          <div class="cmt-meta">${new Date(c.createdAt).toLocaleString('zh-CN')}${c.status === 'resolved' ? ' · 已解决' : ''}</div>
+        </div>
+      `;
+      row.addEventListener('click', () => {
+        const pin = document.querySelector(`.comment-pin[data-id="${c.id}"]`);
+        if (pin) {
+          pin.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          pin.classList.add('flash');
+          setTimeout(() => pin.classList.remove('flash'), 1200);
+          pin.click();
+        }
+      });
+      list.appendChild(row);
+    });
+    sec.appendChild(list);
+    body.appendChild(sec);
+  }
+
+  // 评论列表（kind = comment 或缺省）
+  const comments = getNodeFreeComments(node.uid);
   if (comments.length) {
     const sec = document.createElement('div');
     sec.className = 'ins-section';
@@ -1997,18 +2165,50 @@ function setupSearch() {
 }
 
 // ===== 工具条按钮 =====
-function setupToolbar() {
-  document.getElementById('btn-autolocate').addEventListener('click', autolocateCurrent);
-  document.getElementById('btn-autolocate-all').addEventListener('click', autolocateAll);
-  document.getElementById('btn-hotspots').addEventListener('click', (e) => {
-    HOTSPOTS_VISIBLE = !HOTSPOTS_VISIBLE;
-    document.getElementById('stage').classList.toggle('hotspots-hidden', !HOTSPOTS_VISIBLE);
-    e.currentTarget.classList.toggle('active', HOTSPOTS_VISIBLE);
-  });
-  document.getElementById('btn-hotspots').classList.add('active');
+// 下拉菜单 action 路由
+const TOOLBAR_ACTIONS = {
+  'ai-current':         () => autolocateCurrent(),
+  'ai-batch':           () => autolocateAll(),
+  'hs-toggle':          () => toggleHotspots(),
+  'hs-add':             () => enterAddHotspotMode(),
+  'export-json':        () => openExportDialog(),
+  'import-json':        () => openImportDialog(),
+  'export-review-html': () => alert('评审纪要 (HTML) 导出 — 开发中'),
+  'export-review-docx': () => alert('评审纪要 (Word) 导出 — 开发中'),
+  'import-review':      () => alert('会议纪要导入 — 开发中'),
+};
 
-  // 新增热点：进入画框模式 → 在父图上拖一个矩形 → 弹 prompt 输入子页标题 → 创建子节点 + 保存位置
-  document.getElementById('btn-add-hotspot').addEventListener('click', enterAddHotspotMode);
+let HOTSPOTS_VISIBLE_STATE_INITED = false;
+function toggleHotspots() {
+  HOTSPOTS_VISIBLE = !HOTSPOTS_VISIBLE;
+  document.getElementById('stage').classList.toggle('hotspots-hidden', !HOTSPOTS_VISIBLE);
+}
+
+function setupDropdown(buttonId, menuId) {
+  const btn = document.getElementById(buttonId);
+  const menu = document.getElementById(menuId);
+  if (!btn || !menu) return;
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    // 关闭其他下拉
+    document.querySelectorAll('.tbtn-menu').forEach(m => { if (m !== menu) m.hidden = true; });
+    menu.hidden = !menu.hidden;
+  });
+  menu.addEventListener('click', (e) => {
+    const li = e.target.closest('li[data-act]');
+    if (!li) return;
+    if (li.classList.contains('disabled')) return;
+    const act = li.dataset.act;
+    menu.hidden = true;
+    const fn = TOOLBAR_ACTIONS[act];
+    if (fn) fn();
+  });
+}
+
+function setupToolbar() {
+  setupDropdown('btn-ai-menu', 'dd-ai');
+  setupDropdown('btn-hotspot-menu', 'dd-hotspot');
+  setupDropdown('btn-data-menu', 'dd-data');
 
   // 评论模式切换
   document.getElementById('btn-comment-mode').addEventListener('click', (e) => {
@@ -2020,10 +2220,6 @@ function setupToolbar() {
   // 全局评论列表弹窗
   document.getElementById('btn-comment-list').addEventListener('click', openCommentListPanel);
   updateCommentBadge();
-
-  // 导入导出
-  document.getElementById('btn-export').addEventListener('click', openExportDialog);
-  document.getElementById('btn-import').addEventListener('click', openImportDialog);
 
   document.getElementById('btn-parent').addEventListener('click', () => {
     const p = parentMap.get(CURRENT);
@@ -2038,14 +2234,22 @@ function setupToolbar() {
     if (idx < orderList.length - 1) selectNode(orderList[idx + 1]);
   });
 
+  // 点击外部关闭所有下拉
+  document.addEventListener('click', () => {
+    document.querySelectorAll('.tbtn-menu').forEach(m => { m.hidden = true; });
+  });
+
   window.addEventListener('keydown', (e) => {
-    if (e.target.tagName === 'INPUT') return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     if (e.key === 'ArrowLeft') document.getElementById('btn-prev').click();
     else if (e.key === 'ArrowRight') document.getElementById('btn-next').click();
     else if (e.key === 'ArrowUp') document.getElementById('btn-parent').click();
-    else if (e.key === 'h' || e.key === 'H') document.getElementById('btn-hotspots').click();
+    else if (e.key === 'h' || e.key === 'H') toggleHotspots();
     else if (e.key === 'c' || e.key === 'C') document.getElementById('btn-comment-mode').click();
-    else if (e.key === 'Escape') closeAllPopovers();
+    else if (e.key === 'Escape') {
+      document.querySelectorAll('.tbtn-menu').forEach(m => { m.hidden = true; });
+      closeAllPopovers();
+    }
   });
 }
 
@@ -2246,7 +2450,7 @@ function showHotspotCandidates(node, res) {
 }
 
 async function autolocateCurrent() {
-  const btn = document.getElementById('btn-autolocate');
+  const btn = document.getElementById('btn-ai-menu');
   const node = nodeIndex.get(CURRENT);
   if (!node) return;
   btn.disabled = true;
@@ -2274,7 +2478,7 @@ async function autolocateCurrent() {
 
 // 批量:遍历所有有截图+子节点的父页,依次识别
 async function autolocateAll() {
-  const btn = document.getElementById('btn-autolocate-all');
+  const btn = document.getElementById('btn-ai-menu');
   const allBtn = btn;
   // 收集候选
   const allCandidates = [];
