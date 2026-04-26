@@ -236,6 +236,99 @@ OCR 候选（id. "text"）：
     return mapping
 
 
+def match_review_to_nodes(nodes, review_text, zhipu_key):
+    """把会议纪要文本匹配到节点树。
+    nodes: [{uid, title, note?, description?}, ...]（前端最多传 80 个）
+    review_text: 评审会议纪要原文
+    返回 list，与前端约定：
+    [{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...",
+      "newTodos":[{"text":"...","status":"open"}],"resolveTodoIds":[]}, ...]
+    未命中的纪要段不输出。失败抛异常。
+    """
+    if not zhipu_key:
+        raise RuntimeError('缺 zhipu_key')
+    if not nodes or not review_text or not review_text.strip():
+        return []
+
+    # 节点列表压缩：只保留 LLM 真正需要的字段
+    slim = []
+    for n in nodes[:80]:
+        item = {'uid': n.get('uid'), 'title': n.get('title')}
+        if n.get('note'): item['note'] = str(n['note'])[:120]
+        if n.get('description'): item['description'] = str(n['description'])[:200]
+        slim.append(item)
+    node_json = json.dumps(slim, ensure_ascii=False)
+
+    prompt = f'''你是 UI 评审助手。请把会议纪要中的各段评审内容匹配到对应的节点，并提取「评审结论」和「待确认事项」。
+
+节点列表 (JSON):
+{node_json}
+
+会议纪要原文:
+{review_text}
+
+匹配指引：
+1. 优先按节点 title 与纪要中页面/功能名匹配；title 模糊时参考 note/description
+2. 一段纪要只对应一个节点；若覆盖多页，按段落分别匹配
+3. 「评审结论」= 整页的决议性陈述（如"本页通过"、"按方案 B 修改"）
+4. 「待确认事项」= 具体的待办/疑问（如"按钮文案待 PM 确认"），status="open" 默认
+5. 纪要中明确标注「已解决」「已确认」的待确认事项 → 写到 resolveTodoIds（暂留空）
+6. matchScore: 0~1，title 完全相同 0.95+，关键词命中 0.7~0.9，弱推断 0.5~0.7
+7. 完全无法匹配的段落不输出
+
+严格输出 JSON 数组（不加代码块、不加解释）：
+[{{"nodeUid":"n3","matchScore":0.9,"matchReason":"纪要中『高净值首页』与节点 title 一致","newConclusion":"...","newTodos":[{{"text":"...","status":"open"}}],"resolveTodoIds":[]}}]'''
+
+    body = json.dumps({
+        'model': LLM_MATCH_MODEL,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0.2
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        LLM_MATCH_URL,
+        data=body,
+        headers={
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {zhipu_key}'
+        },
+        method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+    raw = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+    print(f"[review-match] LLM 原始返回: {raw[:500]}")
+    m = re.search(r'\[[\s\S]*\]', raw)
+    if not m:
+        raise ValueError(f'LLM 返回无 JSON: {raw[:200]}')
+    arr = json.loads(m.group(0))
+    # 校验 + 过滤：必须含 nodeUid 且 nodeUid 在 nodes 列表里
+    valid_uids = {n.get('uid') for n in nodes}
+    cleaned = []
+    for it in arr:
+        if not isinstance(it, dict): continue
+        uid = it.get('nodeUid')
+        if uid not in valid_uids: continue
+        # 标准化字段
+        # 清掉 LLM 偶发回吐的 prompt 占位（"..." / "示例" / 空白）
+        concl = str(it.get('newConclusion') or '').strip()
+        if concl in ('', '...', '...。', '示例', '...示例...'):
+            concl = None
+        cleaned.append({
+            'nodeUid': uid,
+            'matchScore': float(it.get('matchScore') or 0),
+            'matchReason': str(it.get('matchReason') or ''),
+            'newConclusion': concl,
+            'newTodos': [
+                {'text': str(t.get('text') or '').strip(),
+                 'status': 'resolved' if t.get('status') == 'resolved' else 'open'}
+                for t in (it.get('newTodos') or []) if isinstance(t, dict) and (t.get('text') or '').strip()
+            ],
+            'resolveTodoIds': [str(x) for x in (it.get('resolveTodoIds') or []) if x],
+        })
+    print(f"[review-match] 命中 {len(cleaned)}/{len(arr)} 项")
+    return cleaned
+
+
 def build_results_from_mapping(targets, ocr_items, mapping):
     """按 target_index → ocr_id 映射构建 results 数组（与字符串匹配输出格式一致）"""
     out = []
@@ -302,10 +395,54 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def _send_json(self, status, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_review_match(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            payload = json.loads(self.rfile.read(length).decode('utf-8'))
+            nodes = payload.get('nodes') or []
+            review_text = payload.get('reviewText') or ''
+            zhipu_key = (
+                payload.get('zhipu_key')
+                or os.environ.get('ZHIPU_API_KEY')
+                or os.environ.get('ANTHROPIC_AUTH_TOKEN')
+                or ''
+            )
+            if not nodes or not review_text.strip():
+                self._send_json(400, {'ok': False, 'error': 'nodes 与 reviewText 都是必填'})
+                return
+            if not zhipu_key:
+                self._send_json(400, {'ok': False, 'error': '服务端无 ZHIPU_API_KEY，且请求未带 zhipu_key'})
+                return
+            print(f"[review-match] 收到 {len(nodes)} 个节点 + {len(review_text)} 字纪要")
+            # 直接返回数组（前端 fetch 后期望 Array）
+            results = match_review_to_nodes(nodes, review_text, zhipu_key)
+            body = json.dumps(results, ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json(500, {'ok': False, 'error': str(e)})
+
     def do_POST(self):
+        if self.path == '/review-match':
+            self._handle_review_match()
+            return
         if self.path != '/ocr-locate':
             self.send_response(404); self._cors(); self.end_headers()
-            self.wfile.write(b'{"error":"POST /ocr-locate only"}')
+            self.wfile.write(b'{"error":"POST /ocr-locate or /review-match only"}')
             return
         try:
             length = int(self.headers.get('Content-Length', 0))
@@ -398,7 +535,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8788
     print(f"✅ MindDeck OCR 定位服务 → http://localhost:{port}")
-    print(f"   接口: POST /ocr-locate")
+    print(f"   接口: POST /ocr-locate · POST /review-match")
     print(f"   切片: {TILE_H}px 高，重叠 {OVERLAP}px")
     print(f"   后端: macOS Vision (ocrmac)")
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
