@@ -1218,6 +1218,55 @@ function renderInspector(node) {
     body.appendChild(sec);
   }
 
+  // 需求描述（Word 路径填充；xmind 路径无）
+  if (node.description) {
+    const sec = document.createElement('div');
+    sec.className = 'ins-section';
+    sec.innerHTML = `
+      <div class="ins-label">需求描述 <span class="tag">DESC</span></div>
+      <div class="ins-note" style="max-height:260px;overflow-y:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${escapeHtml(node.description)}</div>
+    `;
+    body.appendChild(sec);
+  }
+
+  // 表格（Word 路径填充）
+  if (node.tables && node.tables.length) {
+    const sec = document.createElement('div');
+    sec.className = 'ins-section';
+    sec.innerHTML = `<div class="ins-label">表格 · ${node.tables.length}</div>`;
+    node.tables.forEach(t => {
+      const tbl = document.createElement('table');
+      tbl.style.cssText = 'width:100%;border-collapse:collapse;font-size:11px;margin-top:6px';
+      const thead = (t.headers || []).map(h => `<th style="border:1px solid var(--bd);padding:4px 6px;background:var(--bg-2);text-align:left;font-weight:600">${escapeHtml(h)}</th>`).join('');
+      const tbody = (t.rows || []).map(r =>
+        `<tr>${(r || []).map(c => `<td style="border:1px solid var(--bd);padding:4px 6px;vertical-align:top">${escapeHtml(c).replace(/\n/g,'<br>')}</td>`).join('')}</tr>`
+      ).join('');
+      tbl.innerHTML = `<thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody>`;
+      sec.appendChild(tbl);
+    });
+    body.appendChild(sec);
+  }
+
+  // 声明跳转（Word + LLM 抽取填充）
+  if (node.nav_targets && node.nav_targets.length) {
+    const sec = document.createElement('div');
+    sec.className = 'ins-section';
+    sec.innerHTML = `<div class="ins-label">声明跳转 · ${node.nav_targets.length} <span class="tag">AI</span></div>`;
+    const chips = document.createElement('div');
+    chips.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px';
+    node.nav_targets.forEach(nt => {
+      const chip = document.createElement('span');
+      const clickable = !!nt.uid;
+      chip.style.cssText = `padding:3px 8px;border:1px solid var(--bd);border-radius:12px;font-size:11px;cursor:${clickable?'pointer':'default'};background:var(--bg-2);${clickable?'':'opacity:0.6'}`;
+      chip.textContent = '→ ' + (nt.label || '?');
+      if (clickable) chip.addEventListener('click', () => selectNode(nt.uid));
+      if (nt.trigger) chip.title = nt.trigger;
+      chips.appendChild(chip);
+    });
+    sec.appendChild(chips);
+    body.appendChild(sec);
+  }
+
   // 子页面列表
   if (node.children.length) {
     const sec = document.createElement('div');
@@ -1288,7 +1337,7 @@ function renderInspector(node) {
   `;
   body.appendChild(meta);
 
-  if (!node.note && !node.children.length && !node.image) {
+  if (!node.note && !node.children.length && !node.image && !node.description && !(node.tables && node.tables.length) && !(node.nav_targets && node.nav_targets.length)) {
     const hint = document.createElement('div');
     hint.className = 'empty-note';
     hint.textContent = '该节点暂无额外说明。';
