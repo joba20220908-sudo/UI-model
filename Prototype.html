@@ -127,6 +127,39 @@
   .tree-item.has-img .dot {
     background: var(--accent);
   }
+  .tree-item.dragging { opacity: 0.4; }
+  .tree-item.drag-over {
+    background: color-mix(in oklch, var(--accent) 28%, transparent);
+    outline: 1px dashed var(--accent);
+    outline-offset: -1px;
+  }
+  .tree-ops {
+    margin-left: auto;
+    display: none;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+  .tree-item:hover .tree-ops { display: inline-flex; }
+  .tree-ops button {
+    width: 18px; height: 18px;
+    padding: 0;
+    border: 1px solid var(--line);
+    background: var(--bg-1);
+    color: var(--fg-dim);
+    border-radius: 3px;
+    font-size: 12px;
+    line-height: 14px;
+    cursor: pointer;
+  }
+  .tree-ops button:hover {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .tree-ops .tree-op-del:hover {
+    background: #d44;
+    border-color: #d44;
+  }
   .tree-item .chev {
     width: 14px;
     flex-shrink: 0;
@@ -399,6 +432,29 @@
     justify-content: center;
     font-feature-settings: "tnum";
     pointer-events: none;
+  }
+  .hotspot-del {
+    position: absolute;
+    top: -1px; right: -1px;
+    width: 18px; height: 18px;
+    background: rgba(220, 60, 60, 0.92);
+    color: white;
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+    border-radius: 0 3px 0 6px;
+    cursor: pointer;
+    display: none;
+    z-index: 2;
+  }
+  .hotspot:hover .hotspot-del { display: block; }
+  .device-screen.add-hotspot-mode {
+    cursor: crosshair !important;
+  }
+  .device-screen.add-hotspot-mode .hotspot {
+    pointer-events: none;
+    opacity: 0.5;
   }
   .hotspot::after {
     content: attr(data-label);
@@ -1062,6 +1118,7 @@
         <button class="tbtn" id="btn-comment-mode" title="C · 评论模式">💬 评论</button>
         <button class="tbtn" id="btn-comment-list" title="所有未解决评论">🔔<span id="comment-badge" class="badge"></span></button>
         <button class="tbtn" id="btn-hotspots" title="H">热点</button>
+        <button class="tbtn" id="btn-add-hotspot" title="在当前页拖框新增热点">+ 热点</button>
         <button class="tbtn" id="btn-export" title="导出评审数据">📤</button>
         <button class="tbtn" id="btn-import" title="导入评审数据">📥</button>
         <button class="tbtn" id="btn-parent" title="↑">↑</button>

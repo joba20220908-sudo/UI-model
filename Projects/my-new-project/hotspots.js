@@ -44,6 +44,31 @@ function addHotspots(screen, node) {
     badge.textContent = i + 1;
     btn.appendChild(badge);
 
+    // 删除按钮
+    const delBtn = document.createElement('span');
+    delBtn.className = 'hotspot-del';
+    delBtn.textContent = '×';
+    delBtn.title = '删除热点（含对应子页面）';
+    delBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const choice = await confirmDeleteNode(k);
+      if (!choice.ok) return;
+      const store = loadHotspotPositions();
+      if (store[node.uid]) {
+        delete store[node.uid][k.uid];
+        if (!Object.keys(store[node.uid]).length) delete store[node.uid];
+        localStorage.setItem(HOTSPOT_STORE_KEY, JSON.stringify(store));
+      }
+      performDeleteNode(k, choice.withChildren);
+      renderTree();
+      renderScreen(node);
+      renderInspector(node);
+      const tag = choice.withChildren ? '及子孙' : '(子孙已上挂)';
+      showToast(`已删除热点 "${k.title}" ${tag}`);
+    });
+    btn.appendChild(delBtn);
+
     btn.addEventListener('click', (e) => {
       if (btn.dataset.dragging === '1') return;
       selectNode(k.uid);

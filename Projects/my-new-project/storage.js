@@ -346,3 +346,96 @@ function saveHotspotPosition(parentUid, childUid, pos) {
   store[parentUid][childUid] = { ...prev, ...pos };
   localStorage.setItem(HOTSPOT_STORE_KEY, JSON.stringify(store));
 }
+
+// ===== 树层级覆盖：拖拽移动 / 手动新增 / 手动删除 =====
+// Schema: { moves: {uid: newParentUid}, adds: [{uid, parentUid, title, image}], deletes: [uid] }
+const TREE_OVERRIDES_KEY = LS_PREFIX + 'tree_overrides_v1';
+function loadTreeOverrides() {
+  let raw;
+  try { raw = JSON.parse(localStorage.getItem(TREE_OVERRIDES_KEY) || '{}'); }
+  catch { raw = {}; }
+  if (raw && !raw.moves && !raw.adds && !raw.deletes) {
+    const isLegacyFlat = Object.values(raw).every(v => v === null || typeof v === 'string');
+    if (isLegacyFlat && Object.keys(raw).length) {
+      return { moves: raw, adds: [], deletes: [] };
+    }
+  }
+  return {
+    moves: raw.moves || {},
+    adds: raw.adds || [],
+    deletes: raw.deletes || [],
+  };
+}
+function saveTreeOverrides(o) { localStorage.setItem(TREE_OVERRIDES_KEY, JSON.stringify(o)); }
+function hasOverrides(o) {
+  o = o || loadTreeOverrides();
+  return Object.keys(o.moves).length + o.adds.length + o.deletes.length;
+}
+function newCustomUid() {
+  return 'c_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+}
+function isInSubtree(root, candidate) {
+  if (root === candidate) return true;
+  for (const c of root.children) if (isInSubtree(c, candidate)) return true;
+  return false;
+}
+function recomputeDepths(node, d) {
+  node.depth = d;
+  node.children.forEach(c => recomputeDepths(c, d + 1));
+}
+function countDescendants(node) {
+  let n = 0;
+  node.children.forEach(c => { n += 1 + countDescendants(c); });
+  return n;
+}
+(function applyTreeOverridesAtBoot() {
+  const o = loadTreeOverrides();
+  if (!hasOverrides(o)) return;
+  const u2n = new Map(), u2p = new Map();
+  (function walk(n, p) {
+    u2n.set(n.uid, n);
+    if (p) u2p.set(n.uid, p);
+    n.children.forEach(c => walk(c, n));
+  })(TREE, null);
+
+  for (const a of o.adds) {
+    const parent = a.parentUid ? u2n.get(a.parentUid) : TREE;
+    if (!parent) continue;
+    if (u2n.has(a.uid)) continue;
+    const node = {
+      uid: a.uid, depth: 0,
+      title: a.title || '新页面', rawTitle: a.title || '新页面',
+      note: null, image: a.image || null,
+      description: null, tables: null, nav_targets: null,
+      children: [],
+    };
+    parent.children.push(node);
+    u2n.set(a.uid, node);
+    u2p.set(a.uid, parent);
+  }
+
+  for (const [uid, newParentUid] of Object.entries(o.moves)) {
+    const node = u2n.get(uid);
+    const newParent = newParentUid ? u2n.get(newParentUid) : TREE;
+    if (!node || !newParent || isInSubtree(node, newParent)) continue;
+    const oldParent = u2p.get(uid) || TREE;
+    const idx = oldParent.children.indexOf(node);
+    if (idx >= 0) oldParent.children.splice(idx, 1);
+    if (!newParent.children.includes(node)) newParent.children.push(node);
+    u2p.set(uid, newParent);
+  }
+
+  for (const uid of o.deletes) {
+    const node = u2n.get(uid);
+    if (!node) continue;
+    const parent = u2p.get(uid) || TREE;
+    const idx = parent.children.indexOf(node);
+    if (idx >= 0) parent.children.splice(idx, 1);
+    (function purge(n) {
+      u2n.delete(n.uid);
+      u2p.delete(n.uid);
+      n.children.forEach(purge);
+    })(node);
+  }
+  recomputeDepths(TREE, 0);
+})();

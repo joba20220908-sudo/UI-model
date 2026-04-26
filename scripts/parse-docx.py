@@ -27,6 +27,9 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.request
+import urllib.error
 
 try:
     from docx import Document
@@ -116,7 +119,8 @@ def export_image(part, screenshots_dir, exported):
 # ----------------- 节点构造 -----------------
 class Node:
     __slots__ = ('uid', 'depth', 'title', 'rawTitle', 'note', 'image',
-                 'description_parts', 'extra_images', 'tables', 'children')
+                 'description_parts', 'extra_images', 'tables', 'children',
+                 'nav_targets')
 
     def __init__(self, depth, raw_title):
         self.uid = None  # 后填
@@ -129,6 +133,7 @@ class Node:
         self.extra_images = []        # 额外图片文件名（首张归 image，其余在此）
         self.tables = []
         self.children = []
+        self.nav_targets = None
 
     def add_para(self, text, list_style=False):
         if not text or not text.strip():
@@ -161,7 +166,7 @@ class Node:
             'image': self.image,
             'description': description,
             'tables': self.tables if self.tables else None,
-            'nav_targets': None,  # Step 3 LLM pass 填
+            'nav_targets': self.nav_targets,
             'children': [c.to_dict() for c in self.children] if with_children else [],
         }
         return out
@@ -282,19 +287,194 @@ def parse_docx(input_path, project_id, output_dir):
         root.tables = intro_tables
 
     # pre-order 分配 uid
-    counter = [0]
-
-    def assign_uid(n):
-        n.uid = 'n' + str(counter[0])
-        counter[0] += 1
-        for c in n.children:
-            assign_uid(c)
-
-    assign_uid(root)
+    assign_uids(root)
 
     # 项目元信息
     meta = {'id': project_id, 'title': root.title or project_id, 'sub': None}
     return root, meta, exported
+
+
+# ----------------- LLM 重构 + nav_targets 抽取 -----------------
+ZHIPU_CHAT_URL = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+
+
+def call_zhipu(prompt, api_key, model='glm-4-flash', max_retry=3):
+    """同步调智谱 chat completion，含简单退避重试。失败抛异常。"""
+    body = json.dumps({
+        'model': model,
+        'messages': [{'role': 'user', 'content': prompt}],
+    }).encode('utf-8')
+    last_err = None
+    for attempt in range(max_retry + 1):
+        req = urllib.request.Request(
+            ZHIPU_CHAT_URL,
+            data=body,
+            headers={
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {api_key}',
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+                return data['choices'][0]['message']['content'] or ''
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 429 and attempt < max_retry:
+                wait = 2 ** attempt
+                print(f'    429 限流，等 {wait}s 重试...')
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < max_retry:
+                time.sleep(1)
+                continue
+            raise
+    raise last_err
+
+
+def extract_json_array(text):
+    """从 LLM 返回里抽 JSON 数组，容忍 ```json 包裹"""
+    s = (text or '').strip()
+    m = re.search(r'\[[\s\S]*\]', s)
+    if not m:
+        return []
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+
+
+def assign_uids(root):
+    counter = [0]
+
+    def walk(n):
+        n.uid = 'n' + str(counter[0])
+        counter[0] += 1
+        for c in n.children:
+            walk(c)
+    walk(root)
+
+
+def update_depths(node, depth):
+    node.depth = depth
+    for c in node.children:
+        update_depths(c, depth + 1)
+
+
+def collect_h3s(node, out):
+    """收集所有 H3（depth=2 但可能因重组移动了，按是 H2 之下的 page 节点定义）"""
+    if node.depth >= 2 and node.image:  # H3 通常有截图，作为 leaf-ish page
+        out.append(node)
+    for c in node.children:
+        collect_h3s(c, out)
+
+
+def llm_restructure(root, entry_title, api_key):
+    """显式入口 + LLM 抽取「H3 描述里提到的跳转目标 H2」→ re-parent。
+    返回 (re-parented count, nav_targets dict {h3_uid: [{label, trigger}]})
+    """
+    # 找入口 H2
+    entry = next(
+        (c for c in root.children if c.title == entry_title or entry_title in c.title or c.title in entry_title),
+        None,
+    )
+    if not entry:
+        print(f'⚠️  --entry "{entry_title}" 在 H2 中未找到（候选: {[c.title for c in root.children]}），跳过重构')
+        return 0, {}
+
+    # 候选目标 = 除入口外的所有 H2
+    h2_others = [c for c in root.children if c is not entry]
+    if not h2_others:
+        return 0, {}
+
+    # 收集所有 H3（带 description 的页面节点）
+    all_h3 = []
+    for h2 in [entry] + h2_others:
+        for h3 in h2.children:
+            if h3.description_parts:
+                all_h3.append(h3)
+
+    if not all_h3:
+        print('⚠️  没有带描述的 H3，无法做语义匹配')
+        return 0, {}
+
+    print(f'  调用 glm-4-flash 分析 {len(all_h3)} 个 H3 → {len(h2_others)} 个候选目标...')
+
+    def h3_summary(h):
+        desc = ' '.join(h.description_parts)[:280]
+        return f'[{h.uid}] "{h.title}" — {desc}'
+    h3_block = '\n'.join(h3_summary(h) for h in all_h3)
+    targets_block = '\n'.join(f'- "{t.title}"' for t in h2_others)
+
+    prompt = f'''下面是产品需求文档解析出的页面节点。每个 H3 是一个具体页面，描述里可能包含跳转语句（如"点击金刚区进入公募基金"、"跳到 X 页"）。
+
+H3 节点：
+{h3_block}
+
+候选跳转目标（待挂载的页面模块）：
+{targets_block}
+
+任务：识别哪些 H3 描述中**明确**提到跳转到候选目标。返回严格 JSON 数组：
+[{{"h3_uid": "n10", "target": "公募基金", "trigger": "点击金刚区"}}, ...]
+
+要求：
+- 只返回**明确跳转语句**的匹配，模糊不返回
+- target 必须**原样**用候选列表的字符串
+- trigger 是触发动作（< 20 字），用于 UI 提示
+- 同一目标如被多个 H3 引用，只返回第一个最直接的
+
+只输出 JSON 数组，无其他说明文字。'''
+
+    try:
+        raw = call_zhipu(prompt, api_key)
+    except Exception as e:
+        print(f'⚠️  LLM 调用失败: {e}，跳过重构')
+        return 0, {}
+
+    pairs = extract_json_array(raw)
+    print(f'  LLM 返回 {len(pairs)} 条匹配')
+
+    # nav_targets 按 H3 uid 聚合
+    nav_targets = {}
+    re_parent_count = 0
+
+    h3_by_uid = {h.uid: h for h in all_h3}
+    h2_by_title = {h.title: h for h in h2_others}
+
+    for p in pairs:
+        h3_uid = p.get('h3_uid')
+        target_title = p.get('target')
+        trigger = p.get('trigger', '')
+        h3 = h3_by_uid.get(h3_uid)
+        target_node = h2_by_title.get(target_title)
+        if not h3 or not target_node:
+            continue
+        # 记录 nav_target
+        nav_targets.setdefault(h3_uid, []).append({
+            'label': target_title,
+            'trigger': trigger,
+            'uid': target_node.uid,  # 暂存原 uid，re-parent 后 uid 不变
+        })
+        # 仅当 target 仍在 root.children 时才 re-parent（避免重复挂载）
+        if target_node in root.children:
+            root.children.remove(target_node)
+            h3.children.append(target_node)
+            re_parent_count += 1
+            print(f'  ↳ "{target_node.title}" 挂到 "{h3.title}" (触发: {trigger})')
+
+    # 把 nav_targets 写入对应 H3 节点
+    for h3_uid, targets in nav_targets.items():
+        h3 = h3_by_uid[h3_uid]
+        h3.nav_targets = targets
+
+    # 重新计算 depth + 重新分配 uid（pre-order）
+    update_depths(root, 0)
+    # uid 不重排（保持原 uid 让 nav_targets.uid 引用稳定）
+
+    return re_parent_count, nav_targets
 
 
 # ----------------- 输出 data.js -----------------
@@ -317,6 +497,8 @@ def main():
     ap.add_argument('input', help='.docx 输入文件')
     ap.add_argument('output', help='输出项目目录')
     ap.add_argument('--id', help='项目 ID（默认从文件名推断）')
+    ap.add_argument('--entry', help='入口 H2 标题（启用 LLM 重构。例：--entry "APP首页"）')
+    ap.add_argument('--no-llm', action='store_true', help='跳过 LLM 重构，仅按 doc 结构输出')
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -328,6 +510,23 @@ def main():
 
     print(f'解析中：{args.input}')
     root, meta, exported = parse_docx(args.input, project_id, args.output)
+
+    # LLM 重构（可选）
+    if args.entry and not args.no_llm:
+        api_key = os.environ.get('ZHIPU_API_KEY')
+        if not api_key:
+            # 兜底从 ~/.claude/settings.json 读
+            try:
+                d = json.load(open(os.path.expanduser('~/.claude/settings.json')))
+                api_key = (d.get('env') or {}).get('ANTHROPIC_AUTH_TOKEN', '')
+            except Exception:
+                pass
+        if not api_key:
+            print('⚠️  未找到 ZHIPU_API_KEY 环境变量，跳过 LLM 重构')
+        else:
+            print(f'LLM 重构（入口 = "{args.entry}"）...')
+            n_reparented, navs = llm_restructure(root, args.entry, api_key)
+            print(f'  重构: {n_reparented} 个 H2 已挂到 H3 下，{len(navs)} 个 H3 标记了 nav_targets')
 
     data_js_path = os.path.join(args.output, 'data.js')
     with open(data_js_path, 'w', encoding='utf-8') as f:

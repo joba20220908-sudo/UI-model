@@ -29,12 +29,212 @@ const orderList = [];          // 扁平遍历顺序,用于 上一个/下一个
   if (META.title && document.title) document.title = META.title + ' · MindDeck';
 })();
 
-(function buildIndex(node, parentUid) {
-  nodeIndex.set(node.uid, node);
-  if (parentUid) parentMap.set(node.uid, parentUid);
-  orderList.push(node.uid);
-  node.children.forEach(c => buildIndex(c, node.uid));
-})(TREE, null);
+// ===== 树层级覆盖：拖拽移动 / 手动新增 / 手动删除 =====
+// Schema: { moves: {uid: newParentUid}, adds: [{uid, parentUid, title, image}], deletes: [uid] }
+const TREE_OVERRIDES_KEY = LS_PREFIX + 'tree_overrides_v1';
+function loadTreeOverrides() {
+  let raw;
+  try { raw = JSON.parse(localStorage.getItem(TREE_OVERRIDES_KEY) || '{}'); }
+  catch { raw = {}; }
+  // 兼容旧格式（flat {uid: parentUid}）→ 转成 moves
+  if (raw && !raw.moves && !raw.adds && !raw.deletes) {
+    const isLegacyFlat = Object.values(raw).every(v => v === null || typeof v === 'string');
+    if (isLegacyFlat && Object.keys(raw).length) {
+      return { moves: raw, adds: [], deletes: [] };
+    }
+  }
+  return {
+    moves: raw.moves || {},
+    adds: raw.adds || [],
+    deletes: raw.deletes || [],
+  };
+}
+function saveTreeOverrides(o) { localStorage.setItem(TREE_OVERRIDES_KEY, JSON.stringify(o)); }
+function hasOverrides(o) {
+  o = o || loadTreeOverrides();
+  return Object.keys(o.moves).length + o.adds.length + o.deletes.length;
+}
+function newCustomUid() {
+  return 'c_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+}
+function isInSubtree(root, candidate) {
+  if (root === candidate) return true;
+  for (const c of root.children) if (isInSubtree(c, candidate)) return true;
+  return false;
+}
+function recomputeDepths(node, d) {
+  node.depth = d;
+  node.children.forEach(c => recomputeDepths(c, d + 1));
+}
+function countDescendants(node) {
+  let n = 0;
+  node.children.forEach(c => { n += 1 + countDescendants(c); });
+  return n;
+}
+
+// 3 选 1 删除确认：取消 / 仅删本节点（子节点上挂） / 整棵子树删
+// 返回 Promise<{ok: false} | {ok: true, withChildren: bool}>
+function confirmDeleteNode(node) {
+  const kidCount = countDescendants(node);
+  if (!kidCount) {
+    return Promise.resolve(confirm(`删除 "${node.title}"？`) ? { ok: true, withChildren: true } : { ok: false });
+  }
+  return new Promise(resolve => {
+    const mask = document.createElement('div');
+    mask.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999;display:flex;align-items:center;justify-content:center';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:var(--bg-1);color:var(--fg);padding:18px 20px;border-radius:8px;border:1px solid var(--line);min-width:320px;max-width:440px;box-shadow:0 8px 32px rgba(0,0,0,0.4)';
+    box.innerHTML = `
+      <div style="font-size:14px;font-weight:600;margin-bottom:10px">删除 "${escapeHtml(node.title)}"</div>
+      <div style="font-size:12px;color:var(--fg-dim);margin-bottom:16px;line-height:1.6">该节点下有 ${kidCount} 个子孙节点。</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button data-act="keep" style="padding:8px 12px;border:1px solid var(--accent);background:transparent;color:var(--fg);border-radius:6px;cursor:pointer;text-align:left">仅删除本节点<div style="font-size:11px;color:var(--fg-dim);margin-top:2px">子孙节点上挂到父级</div></button>
+        <button data-act="cascade" style="padding:8px 12px;border:1px solid #d44;background:transparent;color:var(--fg);border-radius:6px;cursor:pointer;text-align:left">整棵子树删除<div style="font-size:11px;color:var(--fg-dim);margin-top:2px">连同 ${kidCount} 个子孙一并移除</div></button>
+        <button data-act="cancel" style="padding:8px 12px;border:1px solid var(--line);background:transparent;color:var(--fg-dim);border-radius:6px;cursor:pointer">取消</button>
+      </div>
+    `;
+    box.addEventListener('click', e => {
+      const act = e.target.closest('button')?.dataset.act;
+      if (!act) return;
+      mask.remove();
+      if (act === 'keep') resolve({ ok: true, withChildren: false });
+      else if (act === 'cascade') resolve({ ok: true, withChildren: true });
+      else resolve({ ok: false });
+    });
+    mask.addEventListener('click', e => {
+      if (e.target === mask) { mask.remove(); resolve({ ok: false }); }
+    });
+    mask.appendChild(box);
+    document.body.appendChild(mask);
+  });
+}
+
+// 实际执行删除：写 override + 内存里摘除/重挂
+function performDeleteNode(node, withChildren) {
+  const overrides = loadTreeOverrides();
+  const parentUid = parentMap.get(node.uid);
+  const parent = parentUid ? nodeIndex.get(parentUid) : TREE;
+  const newParentUidForKids = parent === TREE ? null : parent.uid;
+
+  if (!withChildren) {
+    // 子孙上挂到当前节点的 parent
+    for (const c of [...node.children]) {
+      // 若 child 本身是 add，更新它在 adds 里的 parentUid（保持 add 语义）
+      const addEntry = overrides.adds.find(a => a.uid === c.uid);
+      if (addEntry) {
+        addEntry.parentUid = newParentUidForKids;
+      } else {
+        overrides.moves[c.uid] = newParentUidForKids;
+      }
+      // 内存里直接挂
+      const idx = node.children.indexOf(c);
+      if (idx >= 0) node.children.splice(idx, 1);
+      parent.children.push(c);
+    }
+  } else {
+    // 整棵子树要删 → 把子树里所有 add 节点也从 adds 移除（避免 boot 时复活）
+    const subtreeUids = new Set();
+    (function collect(n) { subtreeUids.add(n.uid); n.children.forEach(collect); })(node);
+    overrides.adds = overrides.adds.filter(a => !subtreeUids.has(a.uid));
+    // 也清掉指向子树内的 moves
+    for (const k of Object.keys(overrides.moves)) {
+      if (subtreeUids.has(k)) delete overrides.moves[k];
+    }
+  }
+
+  // 当前节点本身：是 add → 从 adds 移除；否则 → 进 deletes
+  const wasAdd = overrides.adds.some(a => a.uid === node.uid);
+  if (wasAdd) {
+    overrides.adds = overrides.adds.filter(a => a.uid !== node.uid);
+  } else {
+    if (!overrides.deletes.includes(node.uid)) overrides.deletes.push(node.uid);
+  }
+  delete overrides.moves[node.uid];
+
+  // 内存里把节点从 parent.children 摘掉
+  const idx = parent.children.indexOf(node);
+  if (idx >= 0) parent.children.splice(idx, 1);
+
+  saveTreeOverrides(overrides);
+  recomputeDepths(TREE, 0);
+  rebuildIndex();
+}
+(function applyTreeOverridesAtBoot() {
+  const o = loadTreeOverrides();
+  if (!hasOverrides(o)) return;
+  const u2n = new Map(), u2p = new Map();
+  (function walk(n, p) {
+    u2n.set(n.uid, n);
+    if (p) u2p.set(n.uid, p);
+    n.children.forEach(c => walk(c, n));
+  })(TREE, null);
+
+  // 顺序: adds → moves → deletes
+  // 这样"删除节点 X 但保留子孙挂到父级"的语义可由 moves 把子孙先挪走、再 delete X 实现
+
+  // 1. adds
+  for (const a of o.adds) {
+    const parent = a.parentUid ? u2n.get(a.parentUid) : TREE;
+    if (!parent) continue;
+    if (u2n.has(a.uid)) continue;  // 防重复
+    const node = {
+      uid: a.uid,
+      depth: 0,  // recomputeDepths 会重新算
+      title: a.title || '新页面',
+      rawTitle: a.title || '新页面',
+      note: null,
+      image: a.image || null,
+      description: null,
+      tables: null,
+      nav_targets: null,
+      children: [],
+    };
+    parent.children.push(node);
+    u2n.set(a.uid, node);
+    u2p.set(a.uid, parent);
+  }
+
+  // 2. moves
+  for (const [uid, newParentUid] of Object.entries(o.moves)) {
+    const node = u2n.get(uid);
+    const newParent = newParentUid ? u2n.get(newParentUid) : TREE;
+    if (!node || !newParent || isInSubtree(node, newParent)) continue;
+    const oldParent = u2p.get(uid) || TREE;
+    const idx = oldParent.children.indexOf(node);
+    if (idx >= 0) oldParent.children.splice(idx, 1);
+    if (!newParent.children.includes(node)) newParent.children.push(node);
+    u2p.set(uid, newParent);
+  }
+
+  // 3. deletes（含整个剩余子树）
+  for (const uid of o.deletes) {
+    const node = u2n.get(uid);
+    if (!node) continue;
+    const parent = u2p.get(uid) || TREE;
+    const idx = parent.children.indexOf(node);
+    if (idx >= 0) parent.children.splice(idx, 1);
+    (function purge(n) {
+      u2n.delete(n.uid);
+      u2p.delete(n.uid);
+      n.children.forEach(purge);
+    })(node);
+  }
+
+  recomputeDepths(TREE, 0);
+})();
+
+function rebuildIndex() {
+  nodeIndex.clear();
+  parentMap.clear();
+  orderList.length = 0;
+  (function buildIndex(node, parentUid) {
+    nodeIndex.set(node.uid, node);
+    if (parentUid) parentMap.set(node.uid, parentUid);
+    orderList.push(node.uid);
+    node.children.forEach(c => buildIndex(c, node.uid));
+  })(TREE, null);
+}
+rebuildIndex();
 
 let CURRENT = TREE.uid;
 let HOTSPOTS_VISIBLE = true;
@@ -418,6 +618,24 @@ function nodeHasOpenComments(uid) {
 function renderTree() {
   const container = document.getElementById('tree');
   container.innerHTML = '';
+  // 如有手动调整（移动/新增/删除），顶部显示重置按钮
+  const overrides = loadTreeOverrides();
+  const total = hasOverrides(overrides);
+  if (total) {
+    const banner = document.createElement('div');
+    banner.style.cssText = 'padding:6px 10px;margin:4px 6px 8px;background:color-mix(in oklch,var(--accent) 12%,transparent);border-radius:6px;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:8px';
+    const detail = [];
+    if (Object.keys(overrides.moves).length) detail.push(`${Object.keys(overrides.moves).length} 移动`);
+    if (overrides.adds.length) detail.push(`${overrides.adds.length} 新增`);
+    if (overrides.deletes.length) detail.push(`${overrides.deletes.length} 删除`);
+    banner.innerHTML = `<span>已调整 ${detail.join(' · ')}</span><button style="padding:2px 8px;font-size:11px;border:1px solid var(--line);background:transparent;color:var(--fg);border-radius:4px;cursor:pointer">↺ 重置</button>`;
+    banner.querySelector('button').addEventListener('click', () => {
+      if (!confirm('清除所有手动调整（移动/新增/删除），恢复 data.js 原始结构？')) return;
+      localStorage.removeItem(TREE_OVERRIDES_KEY);
+      location.reload();
+    });
+    container.appendChild(banner);
+  }
   renderTreeNodes(TREE.children, container, 0);
 }
 
@@ -465,6 +683,44 @@ function renderTreeNodes(nodes, container, depth) {
       item.appendChild(cm);
     }
 
+    // hover 时显示 + / × 操作按钮
+    const ops = document.createElement('span');
+    ops.className = 'tree-ops';
+    ops.innerHTML = `<button class="tree-op-add" title="新增子节点">+</button><button class="tree-op-del" title="删除节点">×</button>`;
+    ops.querySelector('.tree-op-add').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const title = window.prompt('新页面标题：', '新页面');
+      if (!title) return;
+      const overrides = loadTreeOverrides();
+      const newUid = newCustomUid();
+      overrides.adds.push({ uid: newUid, parentUid: node.uid, title: title.trim(), image: null });
+      saveTreeOverrides(overrides);
+      // 内存里同步插入
+      const newNode = {
+        uid: newUid, depth: node.depth + 1,
+        title: title.trim(), rawTitle: title.trim(),
+        note: null, image: null, description: null, tables: null, nav_targets: null,
+        children: [],
+      };
+      node.children.push(newNode);
+      rebuildIndex();
+      renderTree();
+      showToast(`已新增 "${title.trim()}"`);
+    });
+    ops.querySelector('.tree-op-del').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const choice = await confirmDeleteNode(node);
+      if (!choice.ok) return;
+      const parentUid = parentMap.get(node.uid);
+      const parent = parentUid ? nodeIndex.get(parentUid) : TREE;
+      performDeleteNode(node, choice.withChildren);
+      renderTree();
+      if (CURRENT === node.uid && parent.uid) selectNode(parent.uid);
+      const tag = choice.withChildren ? '及子孙' : '(子孙已上挂)';
+      showToast(`已删除 "${node.title}" ${tag}`);
+    });
+    item.appendChild(ops);
+
     item.addEventListener('click', (e) => {
       if (e.target === chev && hasKids) {
         item.classList.toggle('collapsed');
@@ -473,6 +729,51 @@ function renderTreeNodes(nodes, container, depth) {
         return;
       }
       selectNode(node.uid);
+    });
+
+    // 拖拽重组层级（HTML5 drag-drop）
+    item.draggable = true;
+    item.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/uid', node.uid);
+      e.dataTransfer.effectAllowed = 'move';
+      item.classList.add('dragging');
+    });
+    item.addEventListener('dragend', () => item.classList.remove('dragging'));
+    item.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      item.classList.add('drag-over');
+    });
+    item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
+    item.addEventListener('drop', (e) => {
+      e.preventDefault();
+      item.classList.remove('drag-over');
+      const dragUid = e.dataTransfer.getData('text/uid');
+      if (!dragUid || dragUid === node.uid) return;
+      const moved = nodeIndex.get(dragUid);
+      if (!moved) return;
+      if (isInSubtree(moved, node)) {
+        showToast('不能挂到自己的后代下');
+        return;
+      }
+      // 已经是该 parent 的直接子节点 → 无操作
+      if (node.children.includes(moved)) return;
+      // 1. 从原 parent 摘掉
+      const oldParentUid = parentMap.get(dragUid);
+      const oldParent = oldParentUid ? nodeIndex.get(oldParentUid) : TREE;
+      const idx = oldParent.children.indexOf(moved);
+      if (idx >= 0) oldParent.children.splice(idx, 1);
+      // 2. 挂到新 parent
+      node.children.push(moved);
+      // 3. 持久化 override
+      const overrides = loadTreeOverrides();
+      overrides.moves[dragUid] = node.uid;
+      saveTreeOverrides(overrides);
+      // 4. 重算 depth + 重建索引 + 重渲染
+      recomputeDepths(TREE, 0);
+      rebuildIndex();
+      renderTree();
+      showToast(`"${moved.title}" 已挂到 "${node.title}" 下`);
     });
 
     container.appendChild(item);
@@ -828,6 +1129,104 @@ function defaultHotspotPos(i, total) {
   };
 }
 
+// 新增热点画框模式
+function enterAddHotspotMode() {
+  const node = nodeIndex.get(CURRENT);
+  if (!node || !node.image) {
+    showToast('当前节点无截图，无法添加热点');
+    return;
+  }
+  const screen = document.querySelector('.device-screen');
+  if (!screen) return;
+  showToast('在截图上拖框确定热点区域 · Esc 取消', 5000);
+  screen.classList.add('add-hotspot-mode');
+
+  let startX = 0, startY = 0, drawing = false;
+  const overlay = document.createElement('div');
+  overlay.className = 'add-hotspot-rect';
+  let cleanedUp = false;
+
+  function cleanup() {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    screen.classList.remove('add-hotspot-mode');
+    overlay.remove();
+    screen.removeEventListener('pointerdown', onDown);
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('keydown', onKey);
+  }
+  function onKey(e) { if (e.key === 'Escape') cleanup(); }
+  function onDown(e) {
+    if (e.target.closest('.hotspot') || e.target.closest('.comment-pin')) return;
+    e.preventDefault();
+    drawing = true;
+    const rect = screen.getBoundingClientRect();
+    startX = e.clientX - rect.left;
+    startY = e.clientY - rect.top;
+    overlay.style.cssText = `position:absolute;left:${startX}px;top:${startY}px;width:0;height:0;border:2px dashed var(--accent);background:color-mix(in oklch,var(--accent) 18%,transparent);pointer-events:none;z-index:10`;
+    screen.appendChild(overlay);
+  }
+  function onMove(e) {
+    if (!drawing) return;
+    const rect = screen.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const l = Math.min(startX, x), t = Math.min(startY, y);
+    const w = Math.abs(x - startX), h = Math.abs(y - startY);
+    overlay.style.left = l + 'px';
+    overlay.style.top = t + 'px';
+    overlay.style.width = w + 'px';
+    overlay.style.height = h + 'px';
+  }
+  function onUp(e) {
+    if (!drawing) { cleanup(); return; }
+    drawing = false;
+    const rect = screen.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const l = Math.min(startX, x), t = Math.min(startY, y);
+    const w = Math.abs(x - startX), h = Math.abs(y - startY);
+    if (w < 8 || h < 8) {
+      showToast('框选区域太小，已取消');
+      cleanup();
+      return;
+    }
+    const xPct = l / rect.width * 100;
+    const yPct = t / rect.height * 100;
+    const wPct = w / rect.width * 100;
+    const hPct = h / rect.height * 100;
+    const title = window.prompt('新页面标题：', '新页面');
+    if (!title || !title.trim()) { cleanup(); return; }
+    const newUid = newCustomUid();
+    // 1. 写 add override
+    const overrides = loadTreeOverrides();
+    overrides.adds.push({ uid: newUid, parentUid: node.uid, title: title.trim(), image: null });
+    saveTreeOverrides(overrides);
+    // 2. 内存里挂上
+    const newNode = {
+      uid: newUid, depth: node.depth + 1,
+      title: title.trim(), rawTitle: title.trim(),
+      note: null, image: null, description: null, tables: null, nav_targets: null,
+      children: [],
+    };
+    node.children.push(newNode);
+    // 3. 保存 hotspot 位置（manual=true，避免被 AI 重定位覆盖）
+    saveHotspotPosition(node.uid, newUid, { xPct, yPct, wPct, hPct, manual: true });
+    rebuildIndex();
+    renderTree();
+    renderScreen(node);
+    renderInspector(node);
+    showToast(`已新增热点 "${title.trim()}"`);
+    cleanup();
+  }
+
+  screen.addEventListener('pointerdown', onDown);
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+  window.addEventListener('keydown', onKey);
+}
+
 function addHotspots(screen, node) {
   const kids = node.children.filter(c => nodeHasImage(c) || c.children.length > 0);
   if (!kids.length) return;
@@ -860,6 +1259,33 @@ function addHotspots(screen, node) {
     badge.className = 'hotspot-badge';
     badge.textContent = i + 1;
     btn.appendChild(badge);
+
+    // 删除按钮（hover 显示）— 删 child 节点 + 删 hotspot 位置
+    const delBtn = document.createElement('span');
+    delBtn.className = 'hotspot-del';
+    delBtn.textContent = '×';
+    delBtn.title = '删除热点（含对应子页面）';
+    delBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const choice = await confirmDeleteNode(k);
+      if (!choice.ok) return;
+      // 1. 删 hotspot position
+      const store = loadHotspotPositions();
+      if (store[node.uid]) {
+        delete store[node.uid][k.uid];
+        if (!Object.keys(store[node.uid]).length) delete store[node.uid];
+        localStorage.setItem(HOTSPOT_STORE_KEY, JSON.stringify(store));
+      }
+      // 2. 删 child 节点（含子孙处理）
+      performDeleteNode(k, choice.withChildren);
+      renderTree();
+      renderScreen(node);
+      renderInspector(node);
+      const tag = choice.withChildren ? '及子孙' : '(子孙已上挂)';
+      showToast(`已删除热点 "${k.title}" ${tag}`);
+    });
+    btn.appendChild(delBtn);
 
     btn.addEventListener('click', (e) => {
       if (btn.dataset.dragging === '1') return;  // drag 刚结束,忽略这次 click
@@ -1190,9 +1616,9 @@ function renderInspector(node) {
     node.tables.forEach(t => {
       const tbl = document.createElement('table');
       tbl.style.cssText = 'width:100%;border-collapse:collapse;font-size:11px;margin-top:6px';
-      const thead = (t.headers || []).map(h => `<th style="border:1px solid var(--bd);padding:4px 6px;background:var(--bg-2);text-align:left;font-weight:600">${escapeHtml(h)}</th>`).join('');
+      const thead = (t.headers || []).map(h => `<th style="border:1px solid var(--line);padding:4px 6px;background:var(--bg-2);text-align:left;font-weight:600">${escapeHtml(h)}</th>`).join('');
       const tbody = (t.rows || []).map(r =>
-        `<tr>${(r || []).map(c => `<td style="border:1px solid var(--bd);padding:4px 6px;vertical-align:top">${escapeHtml(c).replace(/\n/g,'<br>')}</td>`).join('')}</tr>`
+        `<tr>${(r || []).map(c => `<td style="border:1px solid var(--line);padding:4px 6px;vertical-align:top">${escapeHtml(c).replace(/\n/g,'<br>')}</td>`).join('')}</tr>`
       ).join('');
       tbl.innerHTML = `<thead><tr>${thead}</tr></thead><tbody>${tbody}</tbody>`;
       sec.appendChild(tbl);
@@ -1210,7 +1636,7 @@ function renderInspector(node) {
     node.nav_targets.forEach(nt => {
       const chip = document.createElement('span');
       const clickable = !!nt.uid;
-      chip.style.cssText = `padding:3px 8px;border:1px solid var(--bd);border-radius:12px;font-size:11px;cursor:${clickable?'pointer':'default'};background:var(--bg-2);${clickable?'':'opacity:0.6'}`;
+      chip.style.cssText = `padding:3px 8px;border:1px solid var(--line);border-radius:12px;font-size:11px;cursor:${clickable?'pointer':'default'};background:var(--bg-2);${clickable?'':'opacity:0.6'}`;
       chip.textContent = '→ ' + (nt.label || '?');
       if (clickable) chip.addEventListener('click', () => selectNode(nt.uid));
       if (nt.trigger) chip.title = nt.trigger;
@@ -1581,6 +2007,9 @@ function setupToolbar() {
   });
   document.getElementById('btn-hotspots').classList.add('active');
 
+  // 新增热点：进入画框模式 → 在父图上拖一个矩形 → 弹 prompt 输入子页标题 → 创建子节点 + 保存位置
+  document.getElementById('btn-add-hotspot').addEventListener('click', enterAddHotspotMode);
+
   // 评论模式切换
   document.getElementById('btn-comment-mode').addEventListener('click', (e) => {
     COMMENT_MODE = !COMMENT_MODE;
@@ -1640,6 +2069,7 @@ async function loadImage(url) {
     i.src = url;
   });
 }
+
 // AI 定位逻辑已抽到 locator.js（provider 链：ocrServer → windowClaude → zhipuVision）
 // 这里只保留 autolocateNode：调用 window.locateHotspots → 选择最佳候选 → 消除重叠。
 // 加新 provider 看 locator.js。
