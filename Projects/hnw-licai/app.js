@@ -2096,12 +2096,15 @@ function buildReviewHtml({ nodes, allComments, allReview, hsAll, imageMap, stats
   let totalNodes = 0;
   (function c(n) { totalNodes++; n.children.forEach(c); })(TREE);
 
+  // 按 node.depth 缩进，配合左侧细线视觉化树形（即便上层节点本身不在 nodes 列表里也保持层级清晰）
+  const minDepth = Math.min(...nodes.map(n => n.depth));
   const tocItems = nodes.map(node => {
     const cmnts = allComments[node.uid] || [];
     const openTodos = cmnts.filter(c => commentKind(c) === 'todo' && c.status === 'open').length;
     const badge = openTodos > 0 ? `<span class="toc-badge">${openTodos}</span>` : '';
     const flag = allReview[node.uid] ? '<span class="toc-flag">✓</span>' : '';
-    return `<li><a class="toc-lnk" href="#nd-${E(node.uid)}">${E(node.title)}${badge}${flag}</a></li>`;
+    const lvl = Math.max(0, node.depth - minDepth);
+    return `<li class="toc-li" data-lvl="${lvl}" style="--lvl:${lvl}"><a class="toc-lnk" href="#nd-${E(node.uid)}">${lvl > 0 ? '<span class="toc-tree"></span>' : ''}<span class="toc-text">${E(node.title)}</span>${badge}${flag}</a></li>`;
   }).join('');
 
   const sections = nodes.map(node => {
@@ -2111,6 +2114,8 @@ function buildReviewHtml({ nodes, allComments, allReview, hsAll, imageMap, stats
     const freeCmnts = cmnts.filter(c => commentKind(c) === 'comment');
     const rev = allReview[uid];
     const hasOpenTodo = todos.some(t => t.status === 'open');
+    const hasResolvedTodo = todos.some(t => t.status === 'resolved');
+    const hasFreeCmt = freeCmnts.length > 0;
 
     const img64 = imageMap[uid];
     let imgHtml = '';
@@ -2149,7 +2154,7 @@ function buildReviewHtml({ nodes, allComments, allReview, hsAll, imageMap, stats
       cmtHtml = `<div class="blk"><div class="blk-hd coll" data-tgt="cmt-${E(uid)}">评论 <b>${freeCmnts.length}</b>${openN ? ` <span class="opn-badge">${openN} 未解决</span>` : ''} <span class="arr">▼</span></div><ul class="cmt-list clp" id="cmt-${E(uid)}">${items}</ul></div>`;
     }
 
-    return `<section id="nd-${E(uid)}" class="sec" data-open="${hasOpenTodo ? 1 : 0}" data-concl="${rev ? 1 : 0}">
+    return `<section id="nd-${E(uid)}" class="sec" data-open="${hasOpenTodo ? 1 : 0}" data-concl="${rev ? 1 : 0}" data-resolved="${hasResolvedTodo ? 1 : 0}" data-cmt="${hasFreeCmt ? 1 : 0}">
 <div class="nd-hd"><h2 class="nd-t">${E(node.title)}</h2><div class="nd-path">${E(getPath(uid).map(n => n.title).join(' › '))}</div></div>
 ${imgHtml}${conclHtml}${todoHtml}${cmtHtml}
 </section>`;
@@ -2171,9 +2176,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans G
 .toc{width:210px;flex-shrink:0;position:sticky;top:50px;max-height:calc(100vh - 70px);overflow-y:auto;background:var(--bg1);border:1px solid var(--bdr);border-radius:var(--r);box-shadow:var(--sh)}
 .toc-hd{padding:10px 14px;font-weight:600;font-size:12px;color:var(--fg2);border-bottom:1px solid var(--bdr);text-transform:uppercase;letter-spacing:.04em}
 .toc ul{list-style:none;padding:4px 0}
-.toc-lnk{display:flex;align-items:center;gap:4px;padding:5px 14px;text-decoration:none;color:var(--fg2);font-size:12px;border-left:3px solid transparent;transition:all .15s}
+.toc-lnk{display:flex;align-items:center;gap:4px;padding:5px 14px 5px calc(14px + var(--lvl,0) * 12px);text-decoration:none;color:var(--fg2);font-size:12px;border-left:3px solid transparent;transition:all .15s;position:relative}
 .toc-lnk:hover,.toc-lnk.cur{color:var(--acc);background:#eff2ff;border-left-color:var(--acc)}
-.toc-lnk span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.toc-text{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.toc-tree{flex-shrink:0;display:inline-block;width:10px;height:10px;border-left:1px solid var(--bdr);border-bottom:1px solid var(--bdr);border-bottom-left-radius:3px;margin-right:2px;align-self:center;transform:translateY(-2px)}
+.toc-li[data-lvl="0"] .toc-lnk{font-weight:600;color:var(--fg)}
 .toc-badge{flex-shrink:0;background:var(--red);color:#fff;font-size:10px;border-radius:10px;padding:1px 5px;font-weight:700}
 .toc-flag{color:var(--grn);font-size:11px;flex-shrink:0}
 .main{flex:1;min-width:0}
@@ -2181,7 +2188,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans G
 .summ-t{font-size:20px;font-weight:700;margin-bottom:4px}
 .summ-m{font-size:12px;color:var(--fg3);margin-bottom:14px}
 .stats{display:flex;gap:12px;flex-wrap:wrap}
-.sc{background:var(--bg);border-radius:6px;padding:10px 14px;min-width:80px;text-align:center}
+.sc{background:var(--bg);border-radius:6px;padding:10px 14px;min-width:80px;text-align:center;cursor:pointer;border:2px solid transparent;transition:all .15s;user-select:none}
+.sc:hover{border-color:#cdd2dc}
+.sc.on{border-color:var(--acc);background:#eff2ff}
+.sc.on.warn{border-color:var(--red);background:#fef2f2}
+.sc.on.ok{border-color:var(--grn);background:#f0fdf4}
 .sc-n{font-size:22px;font-weight:700;color:var(--acc)}
 .sc-l{font-size:11px;color:var(--fg3);margin-top:2px}
 .sc.warn .sc-n{color:var(--red)}.sc.ok .sc-n{color:var(--grn)}
@@ -2237,11 +2248,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans G
       <div class="summ-t">${E(projectTitle)}</div>
       <div class="summ-m">导出时间：${now} · 共 ${totalNodes} 个节点</div>
       <div class="stats">
-        <div class="sc"><div class="sc-n">${nodes.length}</div><div class="sc-l">含内容页面</div></div>
-        <div class="sc ${stats.openTodos > 0 ? 'warn' : 'ok'}"><div class="sc-n">${stats.openTodos}</div><div class="sc-l">未解决事项</div></div>
-        <div class="sc ok"><div class="sc-n">${stats.resolvedTodos}</div><div class="sc-l">已解决事项</div></div>
-        <div class="sc"><div class="sc-n">${stats.conclusions}</div><div class="sc-l">有结论页面</div></div>
-        <div class="sc"><div class="sc-n">${stats.comments}</div><div class="sc-l">自由评论</div></div>
+        <div class="sc on" data-f="all" title="点击查看全部"><div class="sc-n">${nodes.length}</div><div class="sc-l">含内容页面</div></div>
+        <div class="sc ${stats.openTodos > 0 ? 'warn' : 'ok'}" data-f="unresolved" title="点击只看未解决"><div class="sc-n">${stats.openTodos}</div><div class="sc-l">未解决事项</div></div>
+        <div class="sc ok" data-f="resolved" title="点击只看已解决"><div class="sc-n">${stats.resolvedTodos}</div><div class="sc-l">已解决事项</div></div>
+        <div class="sc" data-f="concluded" title="点击只看有结论"><div class="sc-n">${stats.conclusions}</div><div class="sc-l">有结论页面</div></div>
+        <div class="sc" data-f="has-cmt" title="点击只看有评论"><div class="sc-n">${stats.comments}</div><div class="sc-l">自由评论</div></div>
       </div>
     </div>
     ${sections}
@@ -2252,16 +2263,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans G
 (function(){
   var secs=document.querySelectorAll('.sec');
   var fbns=document.querySelectorAll('.fbtn');
-  fbns.forEach(function(b){
-    b.addEventListener('click',function(){
-      var f=b.dataset.f;
-      fbns.forEach(function(x){x.classList.toggle('on',x===b)});
-      secs.forEach(function(s){
-        var show=f==='all'||(f==='unresolved'&&s.dataset.open==='1')||(f==='concluded'&&s.dataset.concl==='1');
-        s.classList.toggle('hide',!show);
-      });
+  var scs=document.querySelectorAll('.sc[data-f]');
+  function applyFilter(f){
+    fbns.forEach(function(x){x.classList.toggle('on',x.dataset.f===f)});
+    scs.forEach(function(x){x.classList.toggle('on',x.dataset.f===f)});
+    secs.forEach(function(s){
+      var show=f==='all'
+        ||(f==='unresolved'&&s.dataset.open==='1')
+        ||(f==='resolved'&&s.dataset.resolved==='1')
+        ||(f==='concluded'&&s.dataset.concl==='1')
+        ||(f==='has-cmt'&&s.dataset.cmt==='1');
+      s.classList.toggle('hide',!show);
     });
-  });
+  }
+  fbns.forEach(function(b){b.addEventListener('click',function(){applyFilter(b.dataset.f);});});
+  scs.forEach(function(c){c.addEventListener('click',function(){applyFilter(c.dataset.f);});});
   document.querySelectorAll('.blk-hd.coll').forEach(function(hd){
     hd.addEventListener('click',function(){
       var list=document.getElementById(hd.dataset.tgt);
