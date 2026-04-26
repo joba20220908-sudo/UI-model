@@ -242,7 +242,9 @@
     padding: 0 14px;
     gap: 12px;
     flex-shrink: 0;
-    overflow: hidden;
+    overflow: visible;
+    z-index: 50;
+    position: relative;
   }
   .crumb {
     display: flex;
@@ -294,7 +296,7 @@
     position: absolute;
     top: calc(100% + 4px);
     right: 0;
-    z-index: 200;
+    z-index: 1000;
     list-style: none;
     margin: 0;
     padding: 4px;
@@ -393,6 +395,11 @@
   }
   .statusbar .icons { display: flex; gap: 5px; align-items: center; }
   .statusbar svg { display: block; }
+  /* HTML 模拟的 iPhone 缺口 + 状态栏：默认隐藏，避免与截图自带状态栏重叠 */
+  .device-screen .notch,
+  .device-screen .statusbar { display: none; }
+  .device-screen.show-chrome .notch { display: block; }
+  .device-screen.show-chrome .statusbar { display: flex; }
 
   .screen-content {
     position: absolute;

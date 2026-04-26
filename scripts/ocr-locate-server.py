@@ -236,6 +236,81 @@ OCR 候选（id. "text"）：
     return mapping
 
 
+def _call_zhipu_chat(prompt, zhipu_key, model=None):
+    """调智谱聊天接口，自动重试。返回 LLM raw 文本。
+    重试策略：
+    - RemoteDisconnected/IncompleteRead/连接错误：立即重试（断连不是限流）
+    - HTTP 429 限流：指数退避 1s/3s/6s，最多重试 3 次
+    """
+    import http.client, time as _t
+    body = json.dumps({
+        'model': model or LLM_MATCH_MODEL,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0.2,
+    }).encode('utf-8')
+    rate_limit_retries = 0
+    conn_err_retried = False
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(
+                LLM_MATCH_URL,
+                data=body,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {zhipu_key}',
+                    'Connection': 'close',
+                },
+                method='POST',
+            )
+            # timeout=35s：智谱推理通常 15-30s，35s 能让大多数请求完成；超过的偶发慢调用砍掉重试
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            return data.get('choices', [{}])[0].get('message', {}).get('content', '')
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and rate_limit_retries < 3:
+                wait = (1, 3, 6)[rate_limit_retries]
+                rate_limit_retries += 1
+                print(f"[review-match] 429 限流，第 {rate_limit_retries} 次退避 {wait}s")
+                _t.sleep(wait)
+                continue
+            raise RuntimeError(f'智谱 API HTTP {e.code}: {e}') from e
+        except (http.client.RemoteDisconnected, http.client.IncompleteRead,
+                urllib.error.URLError, ConnectionError) as e:
+            if not conn_err_retried:
+                conn_err_retried = True
+                print(f"[review-match] 连接失败 ({type(e).__name__})，立即重试")
+                continue
+            raise RuntimeError(f'智谱 API 调用失败：{type(e).__name__}: {e}') from e
+    raise RuntimeError('智谱 API 重试次数耗尽')
+
+
+def _split_review_into_chunks(review_text, target_chars=1200):
+    """把会议纪要切成若干个语义段（按"一、" "二、" 等中文罗马数字标题切；切不开就按 \n\n 切；
+    每个 chunk 控制在 ~target_chars 字以内，过长的段落会再次按 \n 二次切）。"""
+    text = review_text.strip()
+    # 按"一、" "二、" "三、" ... 分；正则用 \n 之后跟一二三..六七八 + 、
+    parts = re.split(r'(?=\n[一二三四五六七八九十]{1,3}、)', '\n' + text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts: parts = [text]
+    chunks, buf = [], ''
+    for p in parts:
+        if len(p) > target_chars * 2:
+            # 单段太长再按 \n\n 切
+            sub = re.split(r'\n\n+', p)
+            for s in sub:
+                if not s.strip(): continue
+                if buf and len(buf) + len(s) > target_chars:
+                    chunks.append(buf); buf = s
+                else:
+                    buf = (buf + '\n\n' + s) if buf else s
+        elif buf and len(buf) + len(p) > target_chars:
+            chunks.append(buf); buf = p
+        else:
+            buf = (buf + '\n\n' + p) if buf else p
+    if buf: chunks.append(buf)
+    return chunks
+
+
 def match_review_to_nodes(nodes, review_text, zhipu_key):
     """把会议纪要文本匹配到节点树。
     nodes: [{uid, title, note?, description?}, ...]（前端最多传 80 个）
@@ -244,28 +319,33 @@ def match_review_to_nodes(nodes, review_text, zhipu_key):
     [{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...",
       "newTodos":[{"text":"...","status":"open"}],"resolveTodoIds":[]}, ...]
     未命中的纪要段不输出。失败抛异常。
+
+    实现：按章节切分纪要 → 每段单独调 LLM（避免长 prompt 被智谱断连）→ 合并结果（同 nodeUid 合并 todos）
     """
     if not zhipu_key:
         raise RuntimeError('缺 zhipu_key')
     if not nodes or not review_text or not review_text.strip():
         return []
 
-    # 节点列表压缩：只保留 LLM 真正需要的字段
-    slim = []
-    for n in nodes[:80]:
-        item = {'uid': n.get('uid'), 'title': n.get('title')}
-        if n.get('note'): item['note'] = str(n['note'])[:120]
-        if n.get('description'): item['description'] = str(n['description'])[:200]
-        slim.append(item)
+    # 节点列表压缩：只保留 uid + title。note/description 加进来收益小、prompt 膨胀大，
+    # 反而会触发智谱长 prompt 断连。LLM 仅靠 title 就能匹配大部分场景。
+    slim = [{'uid': n.get('uid'), 'title': n.get('title')} for n in nodes[:80]]
     node_json = json.dumps(slim, ensure_ascii=False)
 
-    prompt = f'''你是 UI 评审助手。请把会议纪要中的各段评审内容匹配到对应的节点，并提取「评审结论」和「待确认事项」。
+    # target_chars=750：让 chunks 数与并行度（3）匹配，单批跑完；
+    # 每段 prompt 约 2.5-3K 字，仍远低于智谱断连阈值
+    chunks = _split_review_into_chunks(review_text, target_chars=750)
+    print(f"[review-match] 节点 {len(slim)} 个，纪要切成 {len(chunks)} 段（共 {len(review_text)} 字），并行调 LLM")
 
-节点列表 (JSON):
+    def _process_chunk(idx_chunk):
+        i, chunk = idx_chunk
+        prompt = f'''你是 UI 评审助手。请把会议纪要片段中的评审内容匹配到对应的节点，并提取「评审结论」和「待确认事项」。
+
+节点列表 (JSON)：
 {node_json}
 
-会议纪要原文:
-{review_text}
+会议纪要片段（第 {i}/{len(chunks)} 段）：
+{chunk}
 
 匹配指引：
 1. 优先按节点 title 与纪要中页面/功能名匹配；title 模糊时参考 note/description
@@ -277,55 +357,71 @@ def match_review_to_nodes(nodes, review_text, zhipu_key):
 7. 完全无法匹配的段落不输出
 
 严格输出 JSON 数组（不加代码块、不加解释）：
-[{{"nodeUid":"n3","matchScore":0.9,"matchReason":"纪要中『高净值首页』与节点 title 一致","newConclusion":"...","newTodos":[{{"text":"...","status":"open"}}],"resolveTodoIds":[]}}]'''
+[{{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...","newTodos":[{{"text":"...","status":"open"}}],"resolveTodoIds":[]}}]'''
+        try:
+            raw = _call_zhipu_chat(prompt, zhipu_key)
+        except Exception as e:
+            print(f"[review-match] 第 {i}/{len(chunks)} 段失败：{e}，跳过")
+            return []
+        m = re.search(r'\[[\s\S]*\]', raw or '')
+        if not m:
+            print(f"[review-match] 第 {i}/{len(chunks)} 段返回无 JSON: {(raw or '')[:200]}")
+            return []
+        try:
+            arr = json.loads(m.group(0))
+            print(f"[review-match] 第 {i}/{len(chunks)} 段命中 {len(arr) if isinstance(arr, list) else 0} 项")
+            return arr if isinstance(arr, list) else []
+        except Exception as e:
+            print(f"[review-match] 第 {i}/{len(chunks)} 段 JSON 解析失败：{e}")
+            return []
 
-    body = json.dumps({
-        'model': LLM_MATCH_MODEL,
-        'messages': [{'role': 'user', 'content': prompt}],
-        'temperature': 0.2
-    }).encode('utf-8')
-    req = urllib.request.Request(
-        LLM_MATCH_URL,
-        data=body,
-        headers={
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {zhipu_key}'
-        },
-        method='POST'
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-    raw = data.get('choices', [{}])[0].get('message', {}).get('content', '')
-    print(f"[review-match] LLM 原始返回: {raw[:500]}")
-    m = re.search(r'\[[\s\S]*\]', raw)
-    if not m:
-        raise ValueError(f'LLM 返回无 JSON: {raw[:200]}')
-    arr = json.loads(m.group(0))
-    # 校验 + 过滤：必须含 nodeUid 且 nodeUid 在 nodes 列表里
+    # 并行：max_workers=3 — 实测下平衡点。再高（4+）反而因偶发 429/RemoteDisconnected
+    # 触发重试导致总耗时反升。429 与连接错误由 _call_zhipu_chat 内部退避兜底。
+    from concurrent.futures import ThreadPoolExecutor
+    indexed = list(enumerate(chunks, 1))
+    all_items = []
+    with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as ex:
+        for arr in ex.map(_process_chunk, indexed):
+            all_items.extend(arr)
+
+    # 合并：同 nodeUid 的多段输出聚合（合并 todos / 取第一个非空 conclusion）
     valid_uids = {n.get('uid') for n in nodes}
-    cleaned = []
-    for it in arr:
+    merged = {}
+    for it in all_items:
         if not isinstance(it, dict): continue
         uid = it.get('nodeUid')
         if uid not in valid_uids: continue
-        # 标准化字段
-        # 清掉 LLM 偶发回吐的 prompt 占位（"..." / "示例" / 空白）
-        concl = str(it.get('newConclusion') or '').strip()
-        if concl in ('', '...', '...。', '示例', '...示例...'):
-            concl = None
-        cleaned.append({
-            'nodeUid': uid,
-            'matchScore': float(it.get('matchScore') or 0),
-            'matchReason': str(it.get('matchReason') or ''),
-            'newConclusion': concl,
-            'newTodos': [
-                {'text': str(t.get('text') or '').strip(),
-                 'status': 'resolved' if t.get('status') == 'resolved' else 'open'}
-                for t in (it.get('newTodos') or []) if isinstance(t, dict) and (t.get('text') or '').strip()
-            ],
-            'resolveTodoIds': [str(x) for x in (it.get('resolveTodoIds') or []) if x],
-        })
-    print(f"[review-match] 命中 {len(cleaned)}/{len(arr)} 项")
+        if uid not in merged:
+            merged[uid] = {
+                'nodeUid': uid,
+                'matchScore': float(it.get('matchScore') or 0),
+                'matchReason': str(it.get('matchReason') or ''),
+                'newConclusion': '',
+                'newTodos': [],
+                'resolveTodoIds': [],
+            }
+        m = merged[uid]
+        m['matchScore'] = max(m['matchScore'], float(it.get('matchScore') or 0))
+        if not m['matchReason']:
+            m['matchReason'] = str(it.get('matchReason') or '')
+        # 选第一个非占位的 conclusion
+        c = str(it.get('newConclusion') or '').strip()
+        if c and c not in ('...', '...。', '示例', '...示例...') and not m['newConclusion']:
+            m['newConclusion'] = c
+        for t in (it.get('newTodos') or []):
+            if isinstance(t, dict) and (t.get('text') or '').strip():
+                m['newTodos'].append({
+                    'text': str(t['text']).strip(),
+                    'status': 'resolved' if t.get('status') == 'resolved' else 'open',
+                })
+        for x in (it.get('resolveTodoIds') or []):
+            if x: m['resolveTodoIds'].append(str(x))
+
+    cleaned = []
+    for uid, m in merged.items():
+        if not m['newConclusion']: m['newConclusion'] = None
+        cleaned.append(m)
+    print(f"[review-match] 合并后命中 {len(cleaned)} 个节点（共调 {len(chunks)} 次 LLM）")
     return cleaned
 
 

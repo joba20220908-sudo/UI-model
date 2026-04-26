@@ -2493,12 +2493,21 @@ function openReviewImportDialog() {
     const key = apiKeyInput.value.trim();
     if (key) localStorage.setItem('minddeck:zhipu_key', key);
     matchBtn.disabled = true; matchBtn.textContent = '匹配中…';
-    status.style.color = ''; status.textContent = '正在调用 LLM 匹配页面…';
+    status.style.color = '';
+    // 进度计时器：每秒更新文案，避免静默等待焦虑（智谱 LLM 单次推理 15-30s，本流程通常 30-60s）
+    const t0 = Date.now();
+    status.textContent = '正在调用 LLM 匹配页面…(0s)';
+    const progTimer = setInterval(() => {
+      const sec = Math.floor((Date.now() - t0) / 1000);
+      status.textContent = `正在调用 LLM 匹配页面…(${sec}s，通常 30-60s)`;
+    }, 1000);
     try {
       const matches = await matchReviewToNodes(text);
+      clearInterval(progTimer);
       overlay.remove();
       showReviewMatchCandidates(matches);
     } catch (err) {
+      clearInterval(progTimer);
       status.style.color = 'var(--accent)';
       status.textContent = '匹配失败：' + (err.message || err);
       matchBtn.disabled = false; matchBtn.textContent = 'LLM 匹配';
@@ -2514,25 +2523,32 @@ async function matchReviewToNodes(reviewText) {
   })(TREE);
   const nodeJson = JSON.stringify(nodeList.slice(0, 80));
 
-  // Try local OCR server /review-match first
+  // 优先走本地 OCR 服务的 /review-match（同机直连，零 CORS）
+  // 90s 超时：长纪要 + 多节点的 glm-4-flash 调用通常 20-60s
+  let serverReached = false;
   try {
     const resp = await fetch('http://localhost:8788/review-match', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(90000),
       body: JSON.stringify({ nodes: nodeList.slice(0, 80), reviewText }),
     });
-    if (resp.ok) {
-      const data = await resp.json();
-      if (Array.isArray(data) && data.length > 0) return data;
-    }
-  } catch {}
+    serverReached = true;
+    const data = await resp.json().catch(() => null);
+    if (resp.ok && Array.isArray(data)) return data; // 数组（含空数组）都视为有效结果
+    // 服务端报错但能联通 → 透传错误，不再 fallback（fallback 会被 CORS 拦截，徒增混乱）
+    const msg = data && data.error ? data.error : `HTTP ${resp.status}`;
+    throw new Error(`本地服务返回错误：${msg}`);
+  } catch (e) {
+    if (serverReached) throw e;
+    console.warn('[review-match] 本地服务不可达，尝试直连智谱（可能被 CORS 拦截）', e);
+  }
 
-  // Fallback: direct Zhipu glm-4-flash
+  // Fallback: 直连智谱（仅在本地服务不可达时；浏览器对 open.bigmodel.cn 通常有 CORS 限制，常会失败）
   let apiKey = localStorage.getItem('minddeck:zhipu_key');
   if (!apiKey) {
-    apiKey = window.prompt('请输入智谱 API Key（只存本地 localStorage，不上传）：');
-    if (!apiKey) throw new Error('未提供 API Key');
+    apiKey = window.prompt('本地 OCR 服务未启动。\n如继续，将尝试直连智谱（可能被浏览器 CORS 拦截）。\n请输入智谱 API Key：');
+    if (!apiKey) throw new Error('未提供 API Key，且本地 OCR 服务未启动（建议跑 `bash scripts/start.sh`）');
     localStorage.setItem('minddeck:zhipu_key', apiKey.trim());
   }
 
@@ -2548,11 +2564,16 @@ ${reviewText}
 [{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...","newTodos":[{"text":"...","status":"open"}],"resolveTodoIds":[]}]
 未能匹配到节点的段落不输出。`;
 
-  const resp = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', Authorization: `Bearer ${apiKey.trim()}` },
-    body: JSON.stringify({ model: 'glm-4-flash', messages: [{ role: 'user', content: prompt }] }),
-  });
+  let resp;
+  try {
+    resp = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: `Bearer ${apiKey.trim()}` },
+      body: JSON.stringify({ model: 'glm-4-flash', messages: [{ role: 'user', content: prompt }] }),
+    });
+  } catch (netErr) {
+    throw new Error('直连智谱被浏览器拦截（CORS）。请确保本地 OCR 服务已启动：bash scripts/start.sh');
+  }
   if (!resp.ok) {
     if (resp.status === 401) localStorage.removeItem('minddeck:zhipu_key');
     const e = await resp.json().catch(() => ({}));
@@ -2858,7 +2879,9 @@ async function loadImage(url) {
 // 这里只保留 autolocateNode：调用 window.locateHotspots → 选择最佳候选 → 消除重叠。
 // 加新 provider 看 locator.js。
 
-async function autolocateNode(node, { minConf = 0.6, pad = 0.003, dryRun = false } = {}) {
+// pad: AI 框外扩比例（每边），用于把识别紧贴文字的 bbox 撑大方便鼠标抓取
+// minWPct/minHPct: 最小框尺寸（占图片百分比），小于这个尺寸会自动扩到这个值
+async function autolocateNode(node, { minConf = 0.6, pad = 0.015, minWPct = 8, minHPct = 4, dryRun = false } = {}) {
   const url = await resolveNodeImageUrl(node);
   if (!url) return { ok: false, reason: 'no-image' };
   const kids = node.children.filter(c => nodeHasImage(c) || c.children.length > 0);
@@ -2892,10 +2915,21 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003, dryRun = false
       results.push({ uid: k.uid, label: k.title, status: 'low-conf', conf: best.conf });
       return;
     }
-    const xPct = Math.max(0, best.xInFull / fullW * 100 - pad * 100);
-    const yPct = Math.max(0, best.yInFull / fullH * 100 - pad * 100);
-    const wPct = Math.min(100 - xPct, best.w / fullW * 100 + pad * 200);
-    const hPct = Math.min(100 - yPct, best.h / fullH * 100 + pad * 200);
+    // 紧贴 OCR 的 bbox 太瘦 → 加 pad 外扩，再保底到 minWPct/minHPct
+    let xPct = Math.max(0, best.xInFull / fullW * 100 - pad * 100);
+    let yPct = Math.max(0, best.yInFull / fullH * 100 - pad * 100);
+    let wPct = Math.min(100 - xPct, best.w / fullW * 100 + pad * 200);
+    let hPct = Math.min(100 - yPct, best.h / fullH * 100 + pad * 200);
+    if (wPct < minWPct) {
+      const cx = xPct + wPct / 2;
+      wPct = Math.min(minWPct, 100);
+      xPct = Math.max(0, Math.min(100 - wPct, cx - wPct / 2));
+    }
+    if (hPct < minHPct) {
+      const cy = yPct + hPct / 2;
+      hPct = Math.min(minHPct, 100);
+      yPct = Math.max(0, Math.min(100 - hPct, cy - hPct / 2));
+    }
     results.push({ uid: k.uid, label: k.title, status: 'ok', conf: best.conf, pos: { xPct, yPct, wPct, hPct } });
   });
 
