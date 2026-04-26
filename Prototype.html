@@ -281,6 +281,52 @@
     border-color: var(--accent-dim);
     color: var(--fg);
   }
+  .tbtn-sep {
+    width: 1px;
+    height: 18px;
+    background: var(--line);
+    margin: 0 4px;
+    flex-shrink: 0;
+  }
+  /* 下拉菜单组 */
+  .tbtn-group { position: relative; display: inline-flex; flex-shrink: 0; }
+  .tbtn-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 200;
+    list-style: none;
+    margin: 0;
+    padding: 4px;
+    min-width: 200px;
+    background: var(--bg-1);
+    border: 1px solid var(--line-2);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    font-size: 12px;
+  }
+  .tbtn-menu[hidden] { display: none; }
+  .tbtn-menu li {
+    padding: 7px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--fg-dim);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .tbtn-menu li:hover { background: var(--bg-2); color: var(--fg); }
+  .tbtn-menu li.sep {
+    height: 1px;
+    padding: 0;
+    background: var(--line);
+    margin: 4px 0;
+    cursor: default;
+  }
+  .tbtn-menu li.sep:hover { background: var(--line); }
+  .tbtn-menu li.disabled { opacity: 0.5; cursor: not-allowed; }
+  .tbtn-menu li.disabled:hover { background: transparent; color: var(--fg-dim); }
 
   .stage-body {
     flex: 1;
@@ -1113,17 +1159,53 @@
     <div class="stage-toolbar">
       <div class="crumb" id="crumb"></div>
       <div class="toolbar-btns">
-        <button class="tbtn" id="btn-autolocate" title="用 AI 识别当前页的热点位置">🔍 识别</button>
-        <button class="tbtn" id="btn-autolocate-all" title="批量识别所有父页">批量</button>
-        <button class="tbtn" id="btn-comment-mode" title="C · 评论模式">💬 评论</button>
+        <!-- AI 组 -->
+        <div class="tbtn-group">
+          <button class="tbtn" id="btn-ai-menu" title="AI 识别热点">🔍 AI ▾</button>
+          <ul class="tbtn-menu" id="dd-ai" hidden>
+            <li data-act="ai-current">🎯 识别当前页热点</li>
+            <li data-act="ai-batch">📦 批量识别所有父页</li>
+          </ul>
+        </div>
+
+        <span class="tbtn-sep"></span>
+
+        <!-- 评论 -->
+        <button class="tbtn" id="btn-comment-mode" title="C · 进入评论模式">💬 评论</button>
         <button class="tbtn" id="btn-comment-list" title="所有未解决评论">🔔<span id="comment-badge" class="badge"></span></button>
-        <button class="tbtn" id="btn-hotspots" title="H">热点</button>
-        <button class="tbtn" id="btn-add-hotspot" title="在当前页拖框新增热点">+ 热点</button>
-        <button class="tbtn" id="btn-export" title="导出评审数据">📤</button>
-        <button class="tbtn" id="btn-import" title="导入评审数据">📥</button>
-        <button class="tbtn" id="btn-parent" title="↑">↑</button>
-        <button class="tbtn" id="btn-prev" title="←">‹</button>
-        <button class="tbtn" id="btn-next" title="→">›</button>
+
+        <span class="tbtn-sep"></span>
+
+        <!-- 热点组 -->
+        <div class="tbtn-group">
+          <button class="tbtn" id="btn-hotspot-menu" title="热点操作">⊞ 热点 ▾</button>
+          <ul class="tbtn-menu" id="dd-hotspot" hidden>
+            <li data-act="hs-toggle">👁 显示 / 隐藏热点 (H)</li>
+            <li data-act="hs-add">➕ 拖框新增热点</li>
+          </ul>
+        </div>
+
+        <span class="tbtn-sep"></span>
+
+        <!-- 数据组（含纪要） -->
+        <div class="tbtn-group">
+          <button class="tbtn" id="btn-data-menu" title="数据 · 纪要">📁 数据 ▾</button>
+          <ul class="tbtn-menu" id="dd-data" hidden>
+            <li data-act="export-json">📤 导出原型数据 (JSON)</li>
+            <li data-act="import-json">📥 导入原型数据 (JSON)</li>
+            <li class="sep"></li>
+            <li data-act="export-review-html">📋 导出评审纪要 (HTML)</li>
+            <li data-act="export-review-docx">📄 导出评审纪要 (Word)</li>
+            <li data-act="import-review">📝 导入会议纪要…</li>
+          </ul>
+        </div>
+
+        <span class="tbtn-sep"></span>
+
+        <!-- 导航 -->
+        <button class="tbtn" id="btn-parent" title="↑ 父级">↑</button>
+        <button class="tbtn" id="btn-prev" title="← 上一页">‹</button>
+        <button class="tbtn" id="btn-next" title="→ 下一页">›</button>
       </div>
     </div>
     <div class="stage-body">
