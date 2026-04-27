@@ -364,6 +364,7 @@ async function buildExport({ includeImages }) {
     comments: loadComments(),
     hotspots: loadHotspotPositions(),
     imgOverridesMeta: loadImgOverrides(), // {uid: {blobKey, mime, fileName, addedAt, replaced}}
+    review: loadReview(),                 // {uid: {conclusion, updatedAt, updatedBy}}
     current: CURRENT,
     images: {}  // blobKey -> { mime, base64 }  仅 includeImages=true 时填充
   };
@@ -428,6 +429,20 @@ async function applyImport(data, strategy) {
   }
   saveComments(merged);
 
+  // 1.5 评审结论（按 uid 合并）
+  const curRev = loadReview();
+  const incRev = data.review || {};
+  let mergedRev;
+  if (strategy === 'replace') {
+    mergedRev = incRev;
+  } else if (strategy === 'merge-overwrite') {
+    mergedRev = { ...curRev, ...incRev };
+  } else {
+    mergedRev = { ...curRev };
+    for (const uid in incRev) if (!mergedRev[uid]) mergedRev[uid] = incRev[uid];
+  }
+  saveReview(mergedRev);
+
   // 2. 热点位置(按 parentUid → childUid 嵌套)
   const curHs = loadHotspotPositions();
   const incHs = data.hotspots || {};
@@ -488,6 +503,7 @@ async function applyImport(data, strategy) {
     comments: Object.values(merged).reduce((n, arr) => n + arr.length, 0),
     hotspots: Object.values(mergedHs).reduce((n, o) => n + Object.keys(o||{}).length, 0),
     images: data.includeImages ? Object.keys(data.images||{}).length : 0,
+    review: Object.keys(mergedRev || {}).length,
   };
 }
 
@@ -612,6 +628,63 @@ function countOpenComments() {
 }
 function nodeHasOpenComments(uid) {
   return getNodeComments(uid).some(c => c.status === 'open');
+}
+// 评论 kind：'comment'（默认） | 'todo'（待确认事项）
+function commentKind(c) { return (c && c.kind) || 'comment'; }
+function getNodeTodos(uid) {
+  return getNodeComments(uid).filter(c => commentKind(c) === 'todo');
+}
+function getNodeFreeComments(uid) {
+  return getNodeComments(uid).filter(c => commentKind(c) === 'comment');
+}
+
+// ===== 评审结论（per-node 整页结论） =====
+// 结构：{ [uid]: { conclusion, updatedAt, updatedBy } }
+const REVIEW_KEY = LS_PREFIX + 'review_v1';
+function loadReview() {
+  try { return JSON.parse(localStorage.getItem(REVIEW_KEY) || '{}'); }
+  catch { return {}; }
+}
+function saveReview(data) {
+  localStorage.setItem(REVIEW_KEY, JSON.stringify(data || {}));
+}
+function getNodeReview(uid) {
+  return loadReview()[uid] || null;
+}
+function setNodeReview(uid, conclusion, source) {
+  const all = loadReview();
+  const text = String(conclusion || '').trim();
+  if (!text) {
+    delete all[uid];
+  } else {
+    all[uid] = {
+      conclusion: text,
+      updatedAt: Date.now(),
+      updatedBy: source || 'manual',
+    };
+  }
+  saveReview(all);
+}
+function countReviewStats() {
+  const r = loadReview();
+  const all = loadComments();
+  let openTodos = 0, resolvedTodos = 0, totalComments = 0;
+  for (const uid in all) {
+    for (const c of (all[uid] || [])) {
+      if (commentKind(c) === 'todo') {
+        if (c.status === 'resolved') resolvedTodos++;
+        else openTodos++;
+      } else {
+        totalComments++;
+      }
+    }
+  }
+  return {
+    pages: Object.keys(r).length,
+    conclusions: Object.keys(r).length,
+    openTodos, resolvedTodos,
+    comments: totalComments,
+  };
 }
 
 // ===== 大纲树渲染 =====
@@ -929,6 +1002,10 @@ function openCommentComposer(wrap, node, xPct, yPct, anchorPxX, anchorPxY) {
       <span class="pop-title">新增评论</span>
       <span class="pop-drag-hint">拖动移动</span>
     </div>
+    <div class="kind-tabs" style="display:flex;gap:4px;margin:4px 0 8px">
+      <button type="button" class="kind-tab active" data-kind="comment" style="flex:1;padding:4px 8px;font-size:11px;border:1px solid var(--accent-dim);background:color-mix(in oklch,var(--accent) 18%,var(--bg-2));color:var(--fg);border-radius:4px;cursor:pointer">💬 评论</button>
+      <button type="button" class="kind-tab" data-kind="todo" style="flex:1;padding:4px 8px;font-size:11px;border:1px solid var(--line);background:var(--bg-2);color:var(--fg-dim);border-radius:4px;cursor:pointer">✅ 待确认事项</button>
+    </div>
     <textarea placeholder="写一条评论… (Cmd/Ctrl+Enter 保存)" rows="3"></textarea>
     <div class="popover-btns">
       <button class="pv-btn ghost" data-act="cancel">取消</button>
@@ -938,18 +1015,32 @@ function openCommentComposer(wrap, node, xPct, yPct, anchorPxX, anchorPxY) {
   document.body.appendChild(pop);
   positionPopover(pop, anchorPxX, anchorPxY);
   makeDraggable(pop, pop.querySelector('.pop-head'));
-  // 兜底:拦截可能触发"点击外部关闭"的事件
-  // 注意:mouseup/pointerup 不能拦,否则拖拽释放收不到
   ['mousedown','click','pointerdown'].forEach(ev => {
     pop.addEventListener(ev, e => e.stopPropagation());
   });
   const ta = pop.querySelector('textarea');
   ta.focus();
+  // kind 切换
+  let kind = 'comment';
+  pop.querySelectorAll('.kind-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      kind = tab.dataset.kind;
+      pop.querySelectorAll('.kind-tab').forEach(t => {
+        const active = t.dataset.kind === kind;
+        t.classList.toggle('active', active);
+        t.style.borderColor = active ? 'var(--accent-dim)' : 'var(--line)';
+        t.style.background = active ? 'color-mix(in oklch,var(--accent) 18%,var(--bg-2))' : 'var(--bg-2)';
+        t.style.color = active ? 'var(--fg)' : 'var(--fg-dim)';
+      });
+      ta.placeholder = kind === 'todo' ? '描述待确认事项 (Cmd/Ctrl+Enter 保存)' : '写一条评论… (Cmd/Ctrl+Enter 保存)';
+    });
+  });
   pop.querySelector('[data-act="cancel"]').addEventListener('click', () => pop.remove());
   pop.querySelector('[data-act="save"]').addEventListener('click', () => {
     const text = ta.value.trim();
     if (!text) { ta.focus(); return; }
-    addComment(node.uid, xPct, yPct, text);
+    const c = addComment(node.uid, xPct, yPct, text);
+    if (kind === 'todo') updateComment(node.uid, c.id, { kind: 'todo' });
     pop.remove();
     renderScreen(node);
     renderInspector(node);
@@ -1668,8 +1759,85 @@ function renderInspector(node) {
     body.appendChild(sec);
   }
 
-  // 评论列表
-  const comments = getNodeComments(node.uid);
+  // ===== 评审结论（per-node 整页结论）=====
+  {
+    const review = getNodeReview(node.uid);
+    const sec = document.createElement('div');
+    sec.className = 'ins-section';
+    sec.innerHTML = `
+      <div class="ins-label">评审结论 <span class="tag" style="background:color-mix(in oklch,var(--accent) 18%,transparent);border-color:var(--accent-dim);color:var(--fg)">REVIEW</span></div>
+      <textarea class="review-conclusion" rows="3" placeholder="本页评审结论 / 决议… (Cmd/Ctrl+Enter 保存)" style="width:100%;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;color:var(--fg);font-size:12px;padding:6px 8px;resize:vertical;font-family:inherit;line-height:1.5"></textarea>
+      <div class="review-meta" style="margin-top:4px;font-size:10px;color:var(--fg-mute);display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <span class="review-status">${review ? `${review.updatedBy === 'import' ? '🤖 ' : ''}更新于 ${new Date(review.updatedAt).toLocaleString('zh-CN')}` : '尚未填写'}</span>
+        <span class="review-hint" style="opacity:0.7"></span>
+      </div>
+    `;
+    body.appendChild(sec);
+    const ta = sec.querySelector('.review-conclusion');
+    const status = sec.querySelector('.review-status');
+    const hint = sec.querySelector('.review-hint');
+    ta.value = review ? review.conclusion : '';
+    let saveTimer;
+    const persist = () => {
+      const text = ta.value.trim();
+      const before = review ? review.conclusion : '';
+      if (text === before) return;
+      setNodeReview(node.uid, text, 'manual');
+      const now = getNodeReview(node.uid);
+      status.textContent = now ? `更新于 ${new Date(now.updatedAt).toLocaleString('zh-CN')}` : '尚未填写';
+      hint.textContent = '已保存 ✓';
+      setTimeout(() => { hint.textContent = ''; }, 1200);
+    };
+    ta.addEventListener('blur', persist);
+    ta.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        ta.blur();
+      }
+    });
+    ta.addEventListener('input', () => {
+      hint.textContent = '编辑中…';
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(persist, 1500);
+    });
+  }
+
+  // ===== 待确认事项（kind = todo）=====
+  const todos = getNodeTodos(node.uid);
+  if (todos.length) {
+    const sec = document.createElement('div');
+    sec.className = 'ins-section';
+    const openTodo = todos.filter(c => c.status === 'open').length;
+    sec.innerHTML = `<div class="ins-label">待确认事项 · ${todos.length}${openTodo ? ` <span class="tag" style="background:#7a3a00;border-color:#a55;color:#fdc">${openTodo} 待解决</span>` : ` <span class="tag">全部已解决</span>`}</div>`;
+    const list = document.createElement('div');
+    list.className = 'cmt-list';
+    todos.forEach((c, i) => {
+      const row = document.createElement('div');
+      row.className = 'cmt-row' + (c.status === 'resolved' ? ' resolved' : '');
+      row.innerHTML = `
+        <span class="cmt-num">${c.status === 'resolved' ? '✓' : '○'}</span>
+        <div class="cmt-body">
+          <div class="cmt-text">${escapeHtml(c.text)}</div>
+          <div class="cmt-meta">${new Date(c.createdAt).toLocaleString('zh-CN')}${c.status === 'resolved' ? ' · 已解决' : ''}</div>
+        </div>
+      `;
+      row.addEventListener('click', () => {
+        const pin = document.querySelector(`.comment-pin[data-id="${c.id}"]`);
+        if (pin) {
+          pin.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          pin.classList.add('flash');
+          setTimeout(() => pin.classList.remove('flash'), 1200);
+          pin.click();
+        }
+      });
+      list.appendChild(row);
+    });
+    sec.appendChild(list);
+    body.appendChild(sec);
+  }
+
+  // 评论列表（kind = comment 或缺省）
+  const comments = getNodeFreeComments(node.uid);
   if (comments.length) {
     const sec = document.createElement('div');
     sec.className = 'ins-section';
@@ -1797,6 +1965,353 @@ function openExportDialog() {
   });
 }
 
+// ===== 评审纪要导出 =====
+async function exportReviewDoc(format) {
+  const allComments = loadComments();
+  const allReview = loadReview();
+  const hsAll = loadHotspotPositions();
+  const stats = countReviewStats();
+
+  const nodes = [];
+  (function walkCollect(node) {
+    const cmnts = allComments[node.uid] || [];
+    if (nodeHasImage(node) || cmnts.length > 0 || allReview[node.uid]) nodes.push(node);
+    (node.children || []).forEach(walkCollect);
+  })(TREE);
+
+  if (nodes.length === 0) {
+    showToast('暂无评审内容（没有截图、评论或结论），请先完成评审再导出。');
+    return;
+  }
+
+  if (format === 'docx') {
+    exportReviewMarkdown(nodes, allComments, allReview);
+    return;
+  }
+
+  // HTML: show progress modal
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" style="min-width:320px">
+      <div class="modal-header"><span>导出评审纪要 (HTML)</span></div>
+      <div class="modal-body" style="padding:24px 20px">
+        <div id="exp-html-prog" style="font-size:13px;color:var(--fg-dim)">准备中…</div>
+        <div style="margin-top:10px;height:4px;background:var(--line);border-radius:2px">
+          <div id="exp-html-bar" style="height:100%;background:var(--accent);border-radius:2px;width:0%;transition:width .2s"></div>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const progEl = overlay.querySelector('#exp-html-prog');
+  const barEl = overlay.querySelector('#exp-html-bar');
+
+  try {
+    const imageMap = {};
+    for (let i = 0; i < nodes.length; i++) {
+      progEl.textContent = `正在处理截图… ${i + 1} / ${nodes.length}`;
+      barEl.style.width = ((i + 1) / nodes.length * 80) + '%';
+      imageMap[nodes[i].uid] = await nodeImageToBase64(nodes[i]);
+    }
+    progEl.textContent = '正在生成 HTML…';
+    barEl.style.width = '90%';
+
+    const html = buildReviewHtml({ nodes, allComments, allReview, hsAll, imageMap, stats });
+    barEl.style.width = '100%';
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
+    const pid = (META.title || PROJECT_ID).replace(/[\s\/\\:]/g, '-');
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `MindDeck-${pid}-纪要-${ts}.html`;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 0);
+    overlay.remove();
+    showToast(`评审纪要已导出（${nodes.length} 个页面）`);
+  } catch (err) {
+    overlay.remove();
+    alert('导出失败：' + (err.message || err));
+  }
+}
+
+async function nodeImageToBase64(node) {
+  const ov = loadImgOverrides()[node.uid];
+  if (ov && ov.blobKey) {
+    try {
+      const blob = await idbGet(ov.blobKey);
+      if (blob) return await blobToBase64(blob);
+    } catch {}
+  }
+  if (node.image) {
+    try {
+      const resp = await fetch(imagePath(node.image));
+      if (resp.ok) return await blobToBase64(await resp.blob());
+    } catch {}
+  }
+  return null;
+}
+
+function exportReviewMarkdown(nodes, allComments, allReview) {
+  const projectTitle = META.title || PROJECT_ID;
+  const now = new Date().toLocaleString('zh-CN');
+  const lines = [`# ${projectTitle} 评审纪要`, '', `> 导出时间：${now}`, ''];
+
+  for (const node of nodes) {
+    lines.push(`## ${node.title}`, '');
+    lines.push(`**路径：** ${getPath(node.uid).map(n => n.title).join(' › ')}`, '');
+    const rev = allReview[node.uid];
+    if (rev) { lines.push('**评审结论：**', '', rev.conclusion, ''); }
+    const todos = (allComments[node.uid] || []).filter(c => commentKind(c) === 'todo');
+    if (todos.length) {
+      lines.push('**待确认事项：**', '');
+      todos.forEach(t => lines.push(`- ${t.status === 'resolved' ? '[x]' : '[ ]'} ${t.text}`));
+      lines.push('');
+    }
+    const freeCmnts = (allComments[node.uid] || []).filter(c => commentKind(c) === 'comment');
+    if (freeCmnts.length) {
+      lines.push(`**评论（${freeCmnts.length} 条）：**`, '');
+      freeCmnts.forEach(c => lines.push(`- ${c.status === 'resolved' ? '✓' : '○'} ${c.text}`));
+      lines.push('');
+    }
+    lines.push('---', '');
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
+  const pid = projectTitle.replace(/[\s\/\\:]/g, '-');
+  const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `MindDeck-${pid}-纪要-${ts}.md`;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 0);
+  showToast('已下载 Markdown 格式纪要。可拖到 Claude Code，让它用 python-docx 转为正式 .docx');
+}
+
+function buildReviewHtml({ nodes, allComments, allReview, hsAll, imageMap, stats }) {
+  const E = escapeHtml;
+  const projectTitle = META.title || PROJECT_ID;
+  const now = new Date().toLocaleString('zh-CN');
+  let totalNodes = 0;
+  (function c(n) { totalNodes++; n.children.forEach(c); })(TREE);
+
+  // 按 node.depth 缩进，配合左侧细线视觉化树形（即便上层节点本身不在 nodes 列表里也保持层级清晰）
+  const minDepth = Math.min(...nodes.map(n => n.depth));
+  const tocItems = nodes.map(node => {
+    const cmnts = allComments[node.uid] || [];
+    const openTodos = cmnts.filter(c => commentKind(c) === 'todo' && c.status === 'open').length;
+    const badge = openTodos > 0 ? `<span class="toc-badge">${openTodos}</span>` : '';
+    const flag = allReview[node.uid] ? '<span class="toc-flag">✓</span>' : '';
+    const lvl = Math.max(0, node.depth - minDepth);
+    return `<li class="toc-li" data-lvl="${lvl}" style="--lvl:${lvl}"><a class="toc-lnk" href="#nd-${E(node.uid)}">${lvl > 0 ? '<span class="toc-tree"></span>' : ''}<span class="toc-text">${E(node.title)}</span>${badge}${flag}</a></li>`;
+  }).join('');
+
+  const sections = nodes.map(node => {
+    const uid = node.uid;
+    const cmnts = allComments[uid] || [];
+    const todos = cmnts.filter(c => commentKind(c) === 'todo');
+    const freeCmnts = cmnts.filter(c => commentKind(c) === 'comment');
+    const rev = allReview[uid];
+    const hasOpenTodo = todos.some(t => t.status === 'open');
+    const hasResolvedTodo = todos.some(t => t.status === 'resolved');
+    const hasFreeCmt = freeCmnts.length > 0;
+
+    const img64 = imageMap[uid];
+    let imgHtml = '';
+    if (img64) {
+      const hs = hsAll[uid] || {};
+      const overlays = Object.entries(hs).map(([cuid, pos]) => {
+        if (!pos || pos.xPct == null) return '';
+        const child = nodeIndex.get(cuid);
+        return `<div class="hs-ov" style="left:${pos.xPct.toFixed(1)}%;top:${pos.yPct.toFixed(1)}%;width:${(pos.wPct||8).toFixed(1)}%;height:${(pos.hPct||5).toFixed(1)}%" title="${child ? E(child.title) : E(cuid)}"></div>`;
+      }).join('');
+      imgHtml = `<div class="img-wrap"><img class="node-img" src="${E(img64)}" alt="${E(node.title)}" loading="lazy">${overlays}</div>`;
+    }
+
+    let conclHtml;
+    if (rev) {
+      const t = rev.updatedAt ? new Date(rev.updatedAt).toLocaleString('zh-CN') : '';
+      conclHtml = `<div class="concl-card"><div class="concl-lbl">评审结论</div><div class="concl-txt">${E(rev.conclusion)}</div>${t ? `<div class="concl-meta">${t}${rev.updatedBy === 'import' ? ' · 从纪要导入' : ''}</div>` : ''}</div>`;
+    } else {
+      conclHtml = `<div class="concl-card empty"><div class="concl-lbl">评审结论</div><div class="concl-empty">（未填写）</div></div>`;
+    }
+
+    let todoHtml = '';
+    if (todos.length) {
+      const openN = todos.filter(t => t.status === 'open').length;
+      const items = todos.map(t => `<li class="todo ${t.status === 'resolved' ? 'res' : 'opn'}"><span class="todo-ic">${t.status === 'resolved' ? '✓' : '○'}</span><span>${E(t.text)}</span></li>`).join('');
+      todoHtml = `<div class="blk"><div class="blk-hd">待确认事项 <b>${todos.length}</b>${openN ? ` <span class="opn-badge">${openN} 未解决</span>` : ''}</div><ul class="todo-list">${items}</ul></div>`;
+    }
+
+    let cmtHtml = '';
+    if (freeCmnts.length) {
+      const openN = freeCmnts.filter(c => c.status === 'open').length;
+      const items = freeCmnts.map(c => {
+        const pos = c.xPct != null ? `${c.xPct.toFixed(0)}%/${c.yPct.toFixed(0)}%` : '—';
+        return `<li class="cmt ${c.status === 'resolved' ? 'res' : ''}"><span class="cmt-ic">${c.status === 'resolved' ? '✓' : '●'}</span><div><div class="cmt-t">${E(c.text)}</div><div class="cmt-m">位置 ${pos}</div></div></li>`;
+      }).join('');
+      cmtHtml = `<div class="blk"><div class="blk-hd coll" data-tgt="cmt-${E(uid)}">评论 <b>${freeCmnts.length}</b>${openN ? ` <span class="opn-badge">${openN} 未解决</span>` : ''} <span class="arr">▼</span></div><ul class="cmt-list clp" id="cmt-${E(uid)}">${items}</ul></div>`;
+    }
+
+    return `<section id="nd-${E(uid)}" class="sec" data-open="${hasOpenTodo ? 1 : 0}" data-concl="${rev ? 1 : 0}" data-resolved="${hasResolvedTodo ? 1 : 0}" data-cmt="${hasFreeCmt ? 1 : 0}">
+<div class="nd-hd"><h2 class="nd-t">${E(node.title)}</h2><div class="nd-path">${E(getPath(uid).map(n => n.title).join(' › '))}</div></div>
+${imgHtml}${conclHtml}${todoHtml}${cmtHtml}
+</section>`;
+  }).join('\n');
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${E(projectTitle)} 评审纪要</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#f5f6f8;--bg1:#fff;--fg:#1a1a2e;--fg2:#555;--fg3:#888;--acc:#4f6df5;--grn:#22c55e;--red:#ef4444;--bdr:#e2e4ea;--r:8px;--sh:0 2px 8px rgba(0,0,0,.08)}
+body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;font-size:14px;background:var(--bg);color:var(--fg);line-height:1.6}
+#fbar{position:sticky;top:0;z-index:100;background:#1a1a2e;color:#fff;padding:8px 20px;display:flex;align-items:center;gap:10px;box-shadow:0 2px 8px rgba(0,0,0,.25);flex-wrap:wrap}
+.pname{font-weight:600;font-size:15px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fbtn{padding:3px 12px;border:1px solid rgba(255,255,255,.3);border-radius:20px;background:transparent;color:rgba(255,255,255,.75);cursor:pointer;font-size:12px;white-space:nowrap;transition:all .15s}
+.fbtn.on{background:rgba(255,255,255,.18);color:#fff;border-color:rgba(255,255,255,.6)}
+.lay{display:flex;max-width:1400px;margin:0 auto;padding:20px 16px;gap:20px;align-items:flex-start}
+.toc{width:210px;flex-shrink:0;position:sticky;top:50px;max-height:calc(100vh - 70px);overflow-y:auto;background:var(--bg1);border:1px solid var(--bdr);border-radius:var(--r);box-shadow:var(--sh)}
+.toc-hd{padding:10px 14px;font-weight:600;font-size:12px;color:var(--fg2);border-bottom:1px solid var(--bdr);text-transform:uppercase;letter-spacing:.04em}
+.toc ul{list-style:none;padding:4px 0}
+.toc-lnk{display:flex;align-items:center;gap:4px;padding:5px 14px 5px calc(14px + var(--lvl,0) * 12px);text-decoration:none;color:var(--fg2);font-size:12px;border-left:3px solid transparent;transition:all .15s;position:relative}
+.toc-lnk:hover,.toc-lnk.cur{color:var(--acc);background:#eff2ff;border-left-color:var(--acc)}
+.toc-text{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.toc-tree{flex-shrink:0;display:inline-block;width:10px;height:10px;border-left:1px solid var(--bdr);border-bottom:1px solid var(--bdr);border-bottom-left-radius:3px;margin-right:2px;align-self:center;transform:translateY(-2px)}
+.toc-li[data-lvl="0"] .toc-lnk{font-weight:600;color:var(--fg)}
+.toc-badge{flex-shrink:0;background:var(--red);color:#fff;font-size:10px;border-radius:10px;padding:1px 5px;font-weight:700}
+.toc-flag{color:var(--grn);font-size:11px;flex-shrink:0}
+.main{flex:1;min-width:0}
+.summ{background:var(--bg1);border:1px solid var(--bdr);border-radius:var(--r);box-shadow:var(--sh);padding:20px 24px;margin-bottom:20px}
+.summ-t{font-size:20px;font-weight:700;margin-bottom:4px}
+.summ-m{font-size:12px;color:var(--fg3);margin-bottom:14px}
+.stats{display:flex;gap:12px;flex-wrap:wrap}
+.sc{background:var(--bg);border-radius:6px;padding:10px 14px;min-width:80px;text-align:center;cursor:pointer;border:2px solid transparent;transition:all .15s;user-select:none}
+.sc:hover{border-color:#cdd2dc}
+.sc.on{border-color:var(--acc);background:#eff2ff}
+.sc.on.warn{border-color:var(--red);background:#fef2f2}
+.sc.on.ok{border-color:var(--grn);background:#f0fdf4}
+.sc-n{font-size:22px;font-weight:700;color:var(--acc)}
+.sc-l{font-size:11px;color:var(--fg3);margin-top:2px}
+.sc.warn .sc-n{color:var(--red)}.sc.ok .sc-n{color:var(--grn)}
+.sec{background:var(--bg1);border:1px solid var(--bdr);border-radius:var(--r);box-shadow:var(--sh);padding:20px 24px;margin-bottom:16px}
+.sec.hide{display:none}
+.nd-hd{margin-bottom:14px}
+.nd-t{font-size:16px;font-weight:700;margin-bottom:3px}
+.nd-path{font-size:11px;color:var(--fg3)}
+.img-wrap{position:relative;display:inline-block;max-width:100%;margin-bottom:14px;cursor:zoom-in;border-radius:6px;overflow:hidden;border:1px solid var(--bdr)}
+.node-img{display:block;max-width:100%;height:auto;max-height:380px;object-fit:contain}
+.hs-ov{position:absolute;border:2px solid rgba(239,68,68,.75);background:rgba(239,68,68,.08);border-radius:3px;pointer-events:none}
+.concl-card{border-radius:6px;padding:12px 16px;margin-bottom:12px;background:#eff6ff;border:1px solid #bfdbfe}
+.concl-card.empty{background:var(--bg);border-color:var(--bdr)}
+.concl-lbl{font-size:10px;font-weight:700;color:var(--acc);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
+.concl-card.empty .concl-lbl{color:var(--fg3)}
+.concl-txt{font-size:13px;line-height:1.65;white-space:pre-wrap}
+.concl-empty{font-size:12px;color:var(--fg3);font-style:italic}
+.concl-meta{font-size:11px;color:var(--fg3);margin-top:5px}
+.blk{margin-bottom:12px}
+.blk-hd{font-size:12px;font-weight:600;color:var(--fg2);margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.blk-hd.coll{cursor:pointer;user-select:none}
+.blk-hd b{background:var(--bdr);border-radius:10px;padding:1px 7px;font-size:11px;font-weight:600}
+.arr{margin-left:auto;color:var(--fg3);font-size:10px;transition:transform .2s}
+.opn-badge{background:#fef3c7;color:#92400e;border-radius:10px;padding:1px 7px;font-size:11px}
+.todo-list{list-style:none;display:flex;flex-direction:column;gap:4px}
+.todo{display:flex;align-items:flex-start;gap:8px;padding:6px 10px;border-radius:5px;font-size:13px;background:#fff7ed;border:1px solid #fed7aa}
+.todo.res{background:#f0fdf4;border-color:#bbf7d0;opacity:.75}
+.todo-ic{flex-shrink:0;font-weight:700;margin-top:1px}
+.todo.opn .todo-ic{color:var(--red)}.todo.res .todo-ic{color:var(--grn)}
+.cmt-list{list-style:none;display:flex;flex-direction:column;gap:3px;overflow:hidden;max-height:9999px;transition:max-height .25s ease}
+.cmt-list.clp{max-height:0}
+.cmt{display:flex;align-items:flex-start;gap:8px;padding:5px 8px;border-radius:4px;font-size:12px}
+.cmt.res{opacity:.6}
+.cmt-ic{flex-shrink:0;margin-top:2px}
+.cmt-t{flex:1}
+.cmt-m{font-size:10px;color:var(--fg3);margin-top:2px}
+#lb{display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.88);align-items:center;justify-content:center;cursor:zoom-out}
+#lb.on{display:flex}
+#lb img{max-width:90vw;max-height:90vh;border-radius:6px;object-fit:contain;box-shadow:0 8px 40px rgba(0,0,0,.5)}
+@media print{#fbar{display:none}.toc{display:none}.lay{display:block;padding:0}.sec{break-inside:avoid;box-shadow:none;margin-bottom:20px}.cmt-list.clp{max-height:9999px}#lb{display:none!important}.node-img{max-height:none}}
+</style></head>
+<body>
+<div id="fbar">
+  <span class="pname">${E(projectTitle)} · 评审纪要</span>
+  <button class="fbtn on" data-f="all">全部</button>
+  <button class="fbtn" data-f="unresolved">仅未解决</button>
+  <button class="fbtn" data-f="concluded">仅有结论</button>
+</div>
+<div class="lay">
+  <nav class="toc"><div class="toc-hd">目录 · ${nodes.length} 页</div><ul>${tocItems}</ul></nav>
+  <div class="main">
+    <div class="summ">
+      <div class="summ-t">${E(projectTitle)}</div>
+      <div class="summ-m">导出时间：${now} · 共 ${totalNodes} 个节点</div>
+      <div class="stats">
+        <div class="sc on" data-f="all" title="点击查看全部"><div class="sc-n">${nodes.length}</div><div class="sc-l">含内容页面</div></div>
+        <div class="sc ${stats.openTodos > 0 ? 'warn' : 'ok'}" data-f="unresolved" title="点击只看未解决"><div class="sc-n">${stats.openTodos}</div><div class="sc-l">未解决事项</div></div>
+        <div class="sc ok" data-f="resolved" title="点击只看已解决"><div class="sc-n">${stats.resolvedTodos}</div><div class="sc-l">已解决事项</div></div>
+        <div class="sc" data-f="concluded" title="点击只看有结论"><div class="sc-n">${stats.conclusions}</div><div class="sc-l">有结论页面</div></div>
+        <div class="sc" data-f="has-cmt" title="点击只看有评论"><div class="sc-n">${stats.comments}</div><div class="sc-l">自由评论</div></div>
+      </div>
+    </div>
+    ${sections}
+  </div>
+</div>
+<div id="lb"><img id="lb-img" src="" alt=""></div>
+<script>
+(function(){
+  var secs=document.querySelectorAll('.sec');
+  var fbns=document.querySelectorAll('.fbtn');
+  var scs=document.querySelectorAll('.sc[data-f]');
+  function applyFilter(f){
+    fbns.forEach(function(x){x.classList.toggle('on',x.dataset.f===f)});
+    scs.forEach(function(x){x.classList.toggle('on',x.dataset.f===f)});
+    secs.forEach(function(s){
+      var show=f==='all'
+        ||(f==='unresolved'&&s.dataset.open==='1')
+        ||(f==='resolved'&&s.dataset.resolved==='1')
+        ||(f==='concluded'&&s.dataset.concl==='1')
+        ||(f==='has-cmt'&&s.dataset.cmt==='1');
+      s.classList.toggle('hide',!show);
+    });
+  }
+  fbns.forEach(function(b){b.addEventListener('click',function(){applyFilter(b.dataset.f);});});
+  scs.forEach(function(c){c.addEventListener('click',function(){applyFilter(c.dataset.f);});});
+  document.querySelectorAll('.blk-hd.coll').forEach(function(hd){
+    hd.addEventListener('click',function(){
+      var list=document.getElementById(hd.dataset.tgt);
+      if(!list)return;
+      var clp=list.classList.toggle('clp');
+      var arr=hd.querySelector('.arr');
+      if(arr)arr.style.transform=clp?'rotate(-90deg)':'';
+    });
+  });
+  var lb=document.getElementById('lb');
+  var lbImg=document.getElementById('lb-img');
+  document.querySelectorAll('.img-wrap').forEach(function(w){
+    w.addEventListener('click',function(){lbImg.src=w.querySelector('img').src;lb.classList.add('on');});
+  });
+  lb.addEventListener('click',function(){lb.classList.remove('on');lbImg.src='';});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')lb.classList.remove('on');});
+  var links={};
+  document.querySelectorAll('.toc-lnk').forEach(function(a){links[a.getAttribute('href').slice(1)]=a;});
+  if('IntersectionObserver' in window){
+    var obs=new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(en.isIntersecting){
+          Object.values(links).forEach(function(a){a.classList.remove('cur')});
+          var lnk=links[en.target.id];if(lnk)lnk.classList.add('cur');
+        }
+      });
+    },{rootMargin:'-15% 0px -55% 0px'});
+    secs.forEach(function(s){obs.observe(s);});
+  }
+})();
+<\/script>
+</body></html>`;
+}
+
 function openImportDialog() {
   closeAllPopovers();
   document.querySelectorAll('.modal-overlay').forEach(n => n.remove());
@@ -1919,6 +2434,260 @@ function openImportDialog() {
   });
 }
 
+// ===== 会议纪要导入 =====
+function openReviewImportDialog() {
+  closeAllPopovers();
+  document.querySelectorAll('.modal-overlay').forEach(n => n.remove());
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:560px;width:95vw">
+      <div class="modal-header">
+        <span>导入会议纪要</span>
+        <button class="modal-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div style="font-size:12px;color:var(--fg-dim);margin-bottom:10px">粘贴纪要文本，或上传 .md / .txt 文件。LLM 将自动匹配到对应页面，生成待审核的变更建议。</div>
+        <textarea id="rev-text" rows="10" placeholder="粘贴会议纪要…" style="width:100%;resize:vertical;padding:8px;border:1px solid var(--line);background:var(--bg-1);color:var(--fg);border-radius:6px;font-size:13px;font-family:inherit"></textarea>
+        <div style="margin-top:8px;display:flex;align-items:center;gap:8px">
+          <button class="pv-btn ghost" id="rev-upload-btn" style="flex-shrink:0">📂 上传文件</button>
+          <input type="file" id="rev-file" accept=".md,.txt,text/plain,text/markdown" hidden>
+          <span id="rev-fname" style="font-size:12px;color:var(--fg-dim)">—</span>
+        </div>
+        <div id="rev-status" style="margin-top:10px;font-size:12px;min-height:18px"></div>
+        <div style="margin-top:8px;font-size:12px;color:var(--fg-dim);display:flex;align-items:center;gap:6px">
+          智谱 API Key（已存则留空）：
+          <input id="rev-apikey" type="password" placeholder="glzxxx…" style="flex:1;min-width:0;padding:3px 8px;border:1px solid var(--line);background:var(--bg-1);color:var(--fg);border-radius:4px;font-size:12px">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="pv-btn ghost" data-act="cancel">取消</button>
+        <button class="pv-btn primary" id="rev-match-btn">LLM 匹配</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  overlay.querySelector('.modal-close').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('[data-act="cancel"]').addEventListener('click', () => overlay.remove());
+
+  const ta = overlay.querySelector('#rev-text');
+  const fileInput = overlay.querySelector('#rev-file');
+  const status = overlay.querySelector('#rev-status');
+  const apiKeyInput = overlay.querySelector('#rev-apikey');
+  const matchBtn = overlay.querySelector('#rev-match-btn');
+
+  overlay.querySelector('#rev-upload-btn').addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', async () => {
+    const f = fileInput.files[0];
+    if (!f) return;
+    overlay.querySelector('#rev-fname').textContent = f.name;
+    ta.value = await f.text();
+  });
+
+  matchBtn.addEventListener('click', async () => {
+    const text = ta.value.trim();
+    if (!text) { status.style.color = 'var(--accent)'; status.textContent = '请输入纪要文本。'; return; }
+    const key = apiKeyInput.value.trim();
+    if (key) localStorage.setItem('minddeck:zhipu_key', key);
+    matchBtn.disabled = true; matchBtn.textContent = '匹配中…';
+    status.style.color = '';
+    // 进度计时器：每秒更新文案，避免静默等待焦虑（智谱 LLM 单次推理 15-30s，本流程通常 30-60s）
+    const t0 = Date.now();
+    status.textContent = '正在调用 LLM 匹配页面…(0s)';
+    const progTimer = setInterval(() => {
+      const sec = Math.floor((Date.now() - t0) / 1000);
+      status.textContent = `正在调用 LLM 匹配页面…(${sec}s，通常 30-60s)`;
+    }, 1000);
+    try {
+      const matches = await matchReviewToNodes(text);
+      clearInterval(progTimer);
+      overlay.remove();
+      showReviewMatchCandidates(matches);
+    } catch (err) {
+      clearInterval(progTimer);
+      status.style.color = 'var(--accent)';
+      status.textContent = '匹配失败：' + (err.message || err);
+      matchBtn.disabled = false; matchBtn.textContent = 'LLM 匹配';
+    }
+  });
+}
+
+async function matchReviewToNodes(reviewText) {
+  const nodeList = [];
+  (function walk(n) {
+    nodeList.push({ uid: n.uid, title: n.title, note: n.note || null });
+    (n.children || []).forEach(walk);
+  })(TREE);
+  const nodeJson = JSON.stringify(nodeList.slice(0, 80));
+
+  // 优先走本地 OCR 服务的 /review-match（同机直连，零 CORS）
+  // 90s 超时：长纪要 + 多节点的 glm-4-flash 调用通常 20-60s
+  let serverReached = false;
+  try {
+    const resp = await fetch('http://localhost:8788/review-match', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(90000),
+      body: JSON.stringify({ nodes: nodeList.slice(0, 80), reviewText }),
+    });
+    serverReached = true;
+    const data = await resp.json().catch(() => null);
+    if (resp.ok && Array.isArray(data)) return data; // 数组（含空数组）都视为有效结果
+    // 服务端报错但能联通 → 透传错误，不再 fallback（fallback 会被 CORS 拦截，徒增混乱）
+    const msg = data && data.error ? data.error : `HTTP ${resp.status}`;
+    throw new Error(`本地服务返回错误：${msg}`);
+  } catch (e) {
+    if (serverReached) throw e;
+    console.warn('[review-match] 本地服务不可达，尝试直连智谱（可能被 CORS 拦截）', e);
+  }
+
+  // Fallback: 直连智谱（仅在本地服务不可达时；浏览器对 open.bigmodel.cn 通常有 CORS 限制，常会失败）
+  let apiKey = localStorage.getItem('minddeck:zhipu_key');
+  if (!apiKey) {
+    apiKey = window.prompt('本地 OCR 服务未启动。\n如继续，将尝试直连智谱（可能被浏览器 CORS 拦截）。\n请输入智谱 API Key：');
+    if (!apiKey) throw new Error('未提供 API Key，且本地 OCR 服务未启动（建议跑 `bash scripts/start.sh`）');
+    localStorage.setItem('minddeck:zhipu_key', apiKey.trim());
+  }
+
+  const prompt = `你是 UI 评审助手。请将会议纪要中各段评审内容匹配到对应的 UI 节点。
+
+节点列表 (JSON):
+${nodeJson}
+
+会议纪要:
+${reviewText}
+
+输出 JSON 数组（只输出 JSON，无需解释）：
+[{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...","newTodos":[{"text":"...","status":"open"}],"resolveTodoIds":[]}]
+未能匹配到节点的段落不输出。`;
+
+  let resp;
+  try {
+    resp = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: `Bearer ${apiKey.trim()}` },
+      body: JSON.stringify({ model: 'glm-4-flash', messages: [{ role: 'user', content: prompt }] }),
+    });
+  } catch (netErr) {
+    throw new Error('直连智谱被浏览器拦截（CORS）。请确保本地 OCR 服务已启动：bash scripts/start.sh');
+  }
+  if (!resp.ok) {
+    if (resp.status === 401) localStorage.removeItem('minddeck:zhipu_key');
+    const e = await resp.json().catch(() => ({}));
+    throw new Error(`Zhipu API ${resp.status}: ${e.error?.message || resp.statusText}`);
+  }
+  const data = await resp.json();
+  const raw = data.choices?.[0]?.message?.content || '';
+  const m = raw.match(/\[[\s\S]*\]/);
+  if (!m) throw new Error('LLM 返回格式无法解析，请重试');
+  return JSON.parse(m[0]);
+}
+
+function showReviewMatchCandidates(matches) {
+  if (!matches || matches.length === 0) {
+    showToast('LLM 未匹配到任何节点，请检查纪要格式后重试');
+    return;
+  }
+
+  const allNodesList = [];
+  (function walk(n) { allNodesList.push(n); (n.children || []).forEach(walk); })(TREE);
+  const nodeOptions = allNodesList.map(n =>
+    `<option value="${escapeHtml(n.uid)}">${escapeHtml(n.title)}</option>`
+  ).join('');
+
+  const cards = matches.map((m, i) => {
+    const node = nodeIndex.get(m.nodeUid);
+    const nodeName = node ? node.title : (m.nodeUid || '未知节点');
+    const todosHtml = (m.newTodos || []).map((t, ti) =>
+      `<div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+        <input type="checkbox" id="rv-todo-${i}-${ti}" checked>
+        <label for="rv-todo-${i}-${ti}" style="font-size:12px">${escapeHtml(t.text)}</label>
+      </div>`
+    ).join('');
+
+    return `<div class="rv-card" style="background:var(--bg-1);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+        <input type="checkbox" id="rv-card-${i}" checked>
+        <label for="rv-card-${i}" style="font-weight:600;font-size:13px;flex:1">${escapeHtml(nodeName)}</label>
+        <select class="rv-node-sel" data-idx="${i}" style="padding:3px 6px;border:1px solid var(--line);background:var(--bg-1);color:var(--fg);border-radius:4px;font-size:12px;max-width:180px">${nodeOptions}</select>
+        <span style="font-size:11px;color:var(--fg-dim)">${((m.matchScore || 0) * 100).toFixed(0)}%</span>
+      </div>
+      ${m.matchReason ? `<div style="font-size:11px;color:var(--fg-dim);margin-bottom:8px;font-style:italic">${escapeHtml(m.matchReason)}</div>` : ''}
+      ${m.newConclusion ? `<div style="font-size:11px;font-weight:600;color:var(--accent);margin-bottom:3px">评审结论</div>
+        <textarea class="rv-concl" data-idx="${i}" rows="2" style="width:100%;padding:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:4px;font-size:12px;resize:vertical">${escapeHtml(m.newConclusion)}</textarea>` : ''}
+      ${m.newTodos && m.newTodos.length ? `<div style="font-size:11px;font-weight:600;color:var(--accent);margin-top:8px;margin-bottom:2px">待确认事项</div>${todosHtml}` : ''}
+    </div>`;
+  }).join('');
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:620px;width:95vw;max-height:85vh;display:flex;flex-direction:column">
+      <div class="modal-header">
+        <span>审核匹配结果（${matches.length} 条）</span>
+        <button class="modal-close">✕</button>
+      </div>
+      <div class="modal-body" style="overflow-y:auto;flex:1">
+        <div style="font-size:12px;color:var(--fg-dim);margin-bottom:12px">勾选要应用的条目，可编辑结论文本，可通过下拉修正匹配节点。</div>
+        ${cards}
+      </div>
+      <div class="modal-footer">
+        <button class="pv-btn ghost" data-act="cancel">取消</button>
+        <button class="pv-btn primary" data-act="apply">确认提交</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  overlay.querySelector('.modal-close').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('[data-act="cancel"]').addEventListener('click', () => overlay.remove());
+
+  // Pre-select each dropdown to the matched nodeUid
+  matches.forEach((m, i) => {
+    const sel = overlay.querySelector(`.rv-node-sel[data-idx="${i}"]`);
+    if (sel && m.nodeUid) sel.value = m.nodeUid;
+  });
+
+  overlay.querySelector('[data-act="apply"]').addEventListener('click', () => {
+    let applied = 0;
+    const now = Date.now();
+    matches.forEach((m, i) => {
+      if (!overlay.querySelector(`#rv-card-${i}`)?.checked) return;
+      const sel = overlay.querySelector(`.rv-node-sel[data-idx="${i}"]`);
+      const uid = (sel && sel.value) || m.nodeUid;
+      if (!uid) return;
+
+      const conclTa = overlay.querySelector(`.rv-concl[data-idx="${i}"]`);
+      if (conclTa && conclTa.value.trim()) setNodeReview(uid, conclTa.value.trim(), 'import');
+
+      const curList = getNodeComments(uid);
+      (m.newTodos || []).forEach((t, ti) => {
+        if (!overlay.querySelector(`#rv-todo-${i}-${ti}`)?.checked) return;
+        curList.push({
+          id: 'c_' + now + '_' + Math.random().toString(36).slice(2, 6),
+          xPct: 50, yPct: 50, text: t.text,
+          status: t.status || 'open', kind: 'todo',
+          createdAt: now, updatedAt: now,
+        });
+      });
+      if (curList.length) setNodeComments(uid, curList);
+      (m.resolveTodoIds || []).forEach(id => updateComment(uid, id, { status: 'resolved' }));
+      applied++;
+    });
+
+    overlay.remove();
+    const node = nodeIndex.get(CURRENT);
+    if (node) { renderScreen(node); renderInspector(node); }
+    renderTree();
+    updateCommentBadge();
+    showToast(`已应用 ${applied} 条匹配结果`);
+  });
+}
+
 // 简易 toast
 function showToast(msg, duration = 2600) {
   let el = document.getElementById('__toast');
@@ -1997,18 +2766,185 @@ function setupSearch() {
 }
 
 // ===== 工具条按钮 =====
-function setupToolbar() {
-  document.getElementById('btn-autolocate').addEventListener('click', autolocateCurrent);
-  document.getElementById('btn-autolocate-all').addEventListener('click', autolocateAll);
-  document.getElementById('btn-hotspots').addEventListener('click', (e) => {
-    HOTSPOTS_VISIBLE = !HOTSPOTS_VISIBLE;
-    document.getElementById('stage').classList.toggle('hotspots-hidden', !HOTSPOTS_VISIBLE);
-    e.currentTarget.classList.toggle('active', HOTSPOTS_VISIBLE);
-  });
-  document.getElementById('btn-hotspots').classList.add('active');
+// 下拉菜单 action 路由
+const TOOLBAR_ACTIONS = {
+  'ai-current':         () => autolocateCurrent(),
+  'ai-batch':           () => autolocateAll(),
+  'hs-toggle':          () => toggleHotspots(),
+  'hs-add':             () => enterAddHotspotMode(),
+  'export-json':        () => openExportDialog(),
+  'import-json':        () => openImportDialog(),
+  'export-review-html': () => exportReviewDoc('html'),
+  'export-review-docx': () => exportReviewDoc('docx'),
+  'import-review':      () => openReviewImportDialog(),
+};
 
-  // 新增热点：进入画框模式 → 在父图上拖一个矩形 → 弹 prompt 输入子页标题 → 创建子节点 + 保存位置
-  document.getElementById('btn-add-hotspot').addEventListener('click', enterAddHotspotMode);
+let HOTSPOTS_VISIBLE_STATE_INITED = false;
+function toggleHotspots() {
+  HOTSPOTS_VISIBLE = !HOTSPOTS_VISIBLE;
+  document.getElementById('stage').classList.toggle('hotspots-hidden', !HOTSPOTS_VISIBLE);
+}
+
+// ===== 三栏可拖拽 =====
+// 关键决策：
+// - 通过修改 :root 上的 CSS 变量 --col-left / --col-right 来改宽度，
+//   因为 .app 的 grid-template-columns 已经引用这两个变量。这样拖动只
+//   触发样式重计算，不触发布局重建（如改 grid-template 字符串本身）。
+// - setPointerCapture 让 pointer 即便飞出 splitter 仍能继续触发 move/up，
+//   是拖拽组件的标配；普通 mousemove 会在 splitter 边界丢事件。
+// - body.is-resizing-cols 类在拖动期间应用，强制全局光标为 col-resize，
+//   规避 hover 子元素时光标变形带来的"拖到一半好像断了"的错觉。
+const LAYOUT_KEY = 'minddeck:layout_v1'; // 全局（不带项目前缀）：UI 偏好不属于具体项目
+const COL_MIN = { left: 180, right: 220 };
+const COL_MAX = { left: 520, right: 560 };
+const COL_DEFAULT = { left: 280, right: 320 };
+
+function setupSplitters() {
+  const root = document.documentElement;
+  // 1) 启动时恢复用户上次拖出来的宽度
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}');
+    if (typeof saved.left === 'number') root.style.setProperty('--col-left', saved.left + 'px');
+    if (typeof saved.right === 'number') root.style.setProperty('--col-right', saved.right + 'px');
+  } catch {}
+
+  document.querySelectorAll('.splitter').forEach(sp => {
+    const which = sp.dataset.splitter; // 'left' | 'right'
+    const cssVar = which === 'left' ? '--col-left' : '--col-right';
+
+    // 双击 = 重置该侧到默认
+    sp.addEventListener('dblclick', () => {
+      root.style.setProperty(cssVar, COL_DEFAULT[which] + 'px');
+      persist();
+    });
+
+    sp.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      sp.setPointerCapture(e.pointerId); // 锁定后续 pointer 事件到该元素
+      sp.classList.add('dragging');
+      document.body.classList.add('is-resizing-cols');
+
+      // 起始：从计算样式拿当前 grid 列宽（getComputedStyle 总返回 px）
+      const startX = e.clientX;
+      const cs = getComputedStyle(document.querySelector('.app'));
+      const cols = cs.gridTemplateColumns.split(' '); // [left, splitter, center, splitter, right]
+      const startLeft = parseFloat(cols[0]);
+      const startRight = parseFloat(cols[4]);
+
+      const onMove = ev => {
+        const dx = ev.clientX - startX;
+        if (which === 'left') {
+          // 左 splitter：右移 dx → 左栏变宽
+          const w = Math.max(COL_MIN.left, Math.min(COL_MAX.left, startLeft + dx));
+          root.style.setProperty('--col-left', w + 'px');
+        } else {
+          // 右 splitter：右移 dx → 右栏变窄（dx 取反）
+          const w = Math.max(COL_MIN.right, Math.min(COL_MAX.right, startRight - dx));
+          root.style.setProperty('--col-right', w + 'px');
+        }
+      };
+      const onUp = () => {
+        sp.classList.remove('dragging');
+        document.body.classList.remove('is-resizing-cols');
+        sp.removeEventListener('pointermove', onMove);
+        sp.removeEventListener('pointerup', onUp);
+        sp.removeEventListener('pointercancel', onUp);
+        persist();
+      };
+      sp.addEventListener('pointermove', onMove);
+      sp.addEventListener('pointerup', onUp);
+      sp.addEventListener('pointercancel', onUp);
+    });
+  });
+
+  function persist() {
+    const cs = getComputedStyle(document.querySelector('.app'));
+    const cols = cs.gridTemplateColumns.split(' ');
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({
+      left: Math.round(parseFloat(cols[0])),
+      right: Math.round(parseFloat(cols[4])),
+    }));
+  }
+}
+
+// ===== 中间舞台缩放（演示/投屏场景） =====
+// 关键决策：
+// - 用 CSS transform: scale(var(--zoom)) 而不是直接改 width/height —— 单一旋钮，子元素的 % 定位、字体、padding
+//   全部按比例缩放，零额外代码
+// - 现有热点拖拽用 (clientX - rect.left) / rect.width * 100 算百分比，scale 下分子分母同步缩放，比值不变 → 拖拽无误差
+// - 通过 .device 的 margin-bottom: calc((--zoom - 1) * 714px) 给纵向 overflow 留出空间，让 stage-body 的 auto
+//   产生滚动条；不这么做 transform 不影响 layout box，scale 出去的部分会被裁掉看不见
+const ZOOM_KEY = 'minddeck:zoom_v1'; // 全局：投屏会议希望跨项目复用一个倍率
+const ZOOM_MIN = 0.5, ZOOM_MAX = 2.5, ZOOM_STEP = 0.1;
+
+function setupZoom() {
+  const root = document.documentElement;
+  const label = document.getElementById('zoom-label');
+
+  let z = parseFloat(localStorage.getItem(ZOOM_KEY) || '1') || 1;
+  apply(z);
+
+  function apply(v) {
+    v = Math.round(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, v)) * 100) / 100; // 量化到 0.01
+    z = v;
+    root.style.setProperty('--zoom', String(v));
+    if (label) label.textContent = Math.round(v * 100) + '%';
+    localStorage.setItem(ZOOM_KEY, String(v));
+  }
+
+  document.getElementById('btn-zoom-in').addEventListener('click', () => apply(z + ZOOM_STEP));
+  document.getElementById('btn-zoom-out').addEventListener('click', () => apply(z - ZOOM_STEP));
+  // 点击 100% 文字 = 重置
+  if (label) label.addEventListener('click', () => apply(1));
+
+  // 键盘：Cmd/Ctrl + +/-/0（仅当焦点不在 input/textarea 时）
+  window.addEventListener('keydown', e => {
+    const isMod = e.metaKey || e.ctrlKey;
+    if (!isMod) return;
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); apply(z + ZOOM_STEP); }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); apply(z - ZOOM_STEP); }
+    else if (e.key === '0') { e.preventDefault(); apply(1); }
+  });
+
+  // Ctrl/Cmd + 滚轮：在 stage-body 上滚轮缩放
+  const stageBody = document.querySelector('.stage-body');
+  if (stageBody) {
+    stageBody.addEventListener('wheel', e => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      // deltaY < 0 = 上滚 = 放大；用 0.1 步长配合滚轮的连续性，体验更顺滑
+      apply(z + (e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP));
+    }, { passive: false }); // passive:false 才能 preventDefault
+  }
+}
+
+function setupDropdown(buttonId, menuId) {
+  const btn = document.getElementById(buttonId);
+  const menu = document.getElementById(menuId);
+  if (!btn || !menu) return;
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    // 关闭其他下拉
+    document.querySelectorAll('.tbtn-menu').forEach(m => { if (m !== menu) m.hidden = true; });
+    menu.hidden = !menu.hidden;
+  });
+  menu.addEventListener('click', (e) => {
+    const li = e.target.closest('li[data-act]');
+    if (!li) return;
+    if (li.classList.contains('disabled')) return;
+    const act = li.dataset.act;
+    menu.hidden = true;
+    const fn = TOOLBAR_ACTIONS[act];
+    if (fn) fn();
+  });
+}
+
+function setupToolbar() {
+  setupDropdown('btn-ai-menu', 'dd-ai');
+  setupDropdown('btn-hotspot-menu', 'dd-hotspot');
+  setupDropdown('btn-data-menu', 'dd-data');
 
   // 评论模式切换
   document.getElementById('btn-comment-mode').addEventListener('click', (e) => {
@@ -2020,10 +2956,6 @@ function setupToolbar() {
   // 全局评论列表弹窗
   document.getElementById('btn-comment-list').addEventListener('click', openCommentListPanel);
   updateCommentBadge();
-
-  // 导入导出
-  document.getElementById('btn-export').addEventListener('click', openExportDialog);
-  document.getElementById('btn-import').addEventListener('click', openImportDialog);
 
   document.getElementById('btn-parent').addEventListener('click', () => {
     const p = parentMap.get(CURRENT);
@@ -2038,14 +2970,22 @@ function setupToolbar() {
     if (idx < orderList.length - 1) selectNode(orderList[idx + 1]);
   });
 
+  // 点击外部关闭所有下拉
+  document.addEventListener('click', () => {
+    document.querySelectorAll('.tbtn-menu').forEach(m => { m.hidden = true; });
+  });
+
   window.addEventListener('keydown', (e) => {
-    if (e.target.tagName === 'INPUT') return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     if (e.key === 'ArrowLeft') document.getElementById('btn-prev').click();
     else if (e.key === 'ArrowRight') document.getElementById('btn-next').click();
     else if (e.key === 'ArrowUp') document.getElementById('btn-parent').click();
-    else if (e.key === 'h' || e.key === 'H') document.getElementById('btn-hotspots').click();
+    else if (e.key === 'h' || e.key === 'H') toggleHotspots();
     else if (e.key === 'c' || e.key === 'C') document.getElementById('btn-comment-mode').click();
-    else if (e.key === 'Escape') closeAllPopovers();
+    else if (e.key === 'Escape') {
+      document.querySelectorAll('.tbtn-menu').forEach(m => { m.hidden = true; });
+      closeAllPopovers();
+    }
   });
 }
 
@@ -2074,7 +3014,9 @@ async function loadImage(url) {
 // 这里只保留 autolocateNode：调用 window.locateHotspots → 选择最佳候选 → 消除重叠。
 // 加新 provider 看 locator.js。
 
-async function autolocateNode(node, { minConf = 0.6, pad = 0.003, dryRun = false } = {}) {
+// pad: AI 框外扩比例（每边），用于把识别紧贴文字的 bbox 撑大方便鼠标抓取
+// minWPct/minHPct: 最小框尺寸（占图片百分比），小于这个尺寸会自动扩到这个值
+async function autolocateNode(node, { minConf = 0.6, pad = 0.015, minWPct = 8, minHPct = 4, dryRun = false } = {}) {
   const url = await resolveNodeImageUrl(node);
   if (!url) return { ok: false, reason: 'no-image' };
   const kids = node.children.filter(c => nodeHasImage(c) || c.children.length > 0);
@@ -2108,10 +3050,21 @@ async function autolocateNode(node, { minConf = 0.6, pad = 0.003, dryRun = false
       results.push({ uid: k.uid, label: k.title, status: 'low-conf', conf: best.conf });
       return;
     }
-    const xPct = Math.max(0, best.xInFull / fullW * 100 - pad * 100);
-    const yPct = Math.max(0, best.yInFull / fullH * 100 - pad * 100);
-    const wPct = Math.min(100 - xPct, best.w / fullW * 100 + pad * 200);
-    const hPct = Math.min(100 - yPct, best.h / fullH * 100 + pad * 200);
+    // 紧贴 OCR 的 bbox 太瘦 → 加 pad 外扩，再保底到 minWPct/minHPct
+    let xPct = Math.max(0, best.xInFull / fullW * 100 - pad * 100);
+    let yPct = Math.max(0, best.yInFull / fullH * 100 - pad * 100);
+    let wPct = Math.min(100 - xPct, best.w / fullW * 100 + pad * 200);
+    let hPct = Math.min(100 - yPct, best.h / fullH * 100 + pad * 200);
+    if (wPct < minWPct) {
+      const cx = xPct + wPct / 2;
+      wPct = Math.min(minWPct, 100);
+      xPct = Math.max(0, Math.min(100 - wPct, cx - wPct / 2));
+    }
+    if (hPct < minHPct) {
+      const cy = yPct + hPct / 2;
+      hPct = Math.min(minHPct, 100);
+      yPct = Math.max(0, Math.min(100 - hPct, cy - hPct / 2));
+    }
     results.push({ uid: k.uid, label: k.title, status: 'ok', conf: best.conf, pos: { xPct, yPct, wPct, hPct } });
   });
 
@@ -2246,7 +3199,7 @@ function showHotspotCandidates(node, res) {
 }
 
 async function autolocateCurrent() {
-  const btn = document.getElementById('btn-autolocate');
+  const btn = document.getElementById('btn-ai-menu');
   const node = nodeIndex.get(CURRENT);
   if (!node) return;
   btn.disabled = true;
@@ -2274,7 +3227,7 @@ async function autolocateCurrent() {
 
 // 批量:遍历所有有截图+子节点的父页,依次识别
 async function autolocateAll() {
-  const btn = document.getElementById('btn-autolocate-all');
+  const btn = document.getElementById('btn-ai-menu');
   const allBtn = btn;
   // 收集候选
   const allCandidates = [];
@@ -2325,6 +3278,8 @@ async function autolocateAll() {
 renderTree();
 setupSearch();
 setupToolbar();
+setupSplitters();
+setupZoom();
 
 const restored = (() => {
   try { return localStorage.getItem(LS_PREFIX + 'current'); } catch { return null; }

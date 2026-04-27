@@ -236,6 +236,233 @@ OCR 候选（id. "text"）：
     return mapping
 
 
+def _call_zhipu_chat(prompt, zhipu_key, model=None):
+    """调智谱聊天接口，自动重试。返回 LLM raw 文本。
+    重试策略：
+    - RemoteDisconnected/IncompleteRead/连接错误：立即重试（断连不是限流）
+    - HTTP 429 限流：指数退避 1s/3s/6s，最多重试 3 次
+    """
+    import http.client, time as _t
+    body = json.dumps({
+        'model': model or LLM_MATCH_MODEL,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0.2,
+    }).encode('utf-8')
+    rate_limit_retries = 0
+    conn_err_retried = False
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(
+                LLM_MATCH_URL,
+                data=body,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {zhipu_key}',
+                    'Connection': 'close',
+                },
+                method='POST',
+            )
+            # timeout=35s：智谱推理通常 15-30s，35s 能让大多数请求完成；超过的偶发慢调用砍掉重试
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            return data.get('choices', [{}])[0].get('message', {}).get('content', '')
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and rate_limit_retries < 3:
+                wait = (1, 3, 6)[rate_limit_retries]
+                rate_limit_retries += 1
+                print(f"[review-match] 429 限流，第 {rate_limit_retries} 次退避 {wait}s")
+                _t.sleep(wait)
+                continue
+            raise RuntimeError(f'智谱 API HTTP {e.code}: {e}') from e
+        except (http.client.RemoteDisconnected, http.client.IncompleteRead,
+                urllib.error.URLError, ConnectionError) as e:
+            if not conn_err_retried:
+                conn_err_retried = True
+                print(f"[review-match] 连接失败 ({type(e).__name__})，立即重试")
+                continue
+            raise RuntimeError(f'智谱 API 调用失败：{type(e).__name__}: {e}') from e
+    raise RuntimeError('智谱 API 重试次数耗尽')
+
+
+def _split_review_into_chunks(review_text, target_chars=1200):
+    """把会议纪要切成若干个语义段（按"一、" "二、" 等中文罗马数字标题切；切不开就按 \n\n 切；
+    每个 chunk 控制在 ~target_chars 字以内，过长的段落会再次按 \n 二次切）。"""
+    text = review_text.strip()
+    # 按"一、" "二、" "三、" ... 分；正则用 \n 之后跟一二三..六七八 + 、
+    parts = re.split(r'(?=\n[一二三四五六七八九十]{1,3}、)', '\n' + text)
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts: parts = [text]
+    chunks, buf = [], ''
+    for p in parts:
+        if len(p) > target_chars * 2:
+            # 单段太长再按 \n\n 切
+            sub = re.split(r'\n\n+', p)
+            for s in sub:
+                if not s.strip(): continue
+                if buf and len(buf) + len(s) > target_chars:
+                    chunks.append(buf); buf = s
+                else:
+                    buf = (buf + '\n\n' + s) if buf else s
+        elif buf and len(buf) + len(p) > target_chars:
+            chunks.append(buf); buf = p
+        else:
+            buf = (buf + '\n\n' + p) if buf else p
+    if buf: chunks.append(buf)
+    return chunks
+
+
+def match_review_to_nodes(nodes, review_text, zhipu_key):
+    """把会议纪要文本匹配到节点树。
+    nodes: [{uid, title, note?, description?}, ...]（前端最多传 80 个）
+    review_text: 评审会议纪要原文
+    返回 list，与前端约定：
+    [{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...",
+      "newTodos":[{"text":"...","status":"open"}],"resolveTodoIds":[]}, ...]
+    未命中的纪要段不输出。失败抛异常。
+
+    实现：按章节切分纪要 → 每段单独调 LLM（避免长 prompt 被智谱断连）→ 合并结果（同 nodeUid 合并 todos）
+    """
+    if not zhipu_key:
+        raise RuntimeError('缺 zhipu_key')
+    if not nodes or not review_text or not review_text.strip():
+        return []
+
+    # 节点列表压缩：只保留 uid + title。note/description 加进来收益小、prompt 膨胀大，
+    # 反而会触发智谱长 prompt 断连。LLM 仅靠 title 就能匹配大部分场景。
+    slim = [{'uid': n.get('uid'), 'title': n.get('title')} for n in nodes[:80]]
+    node_json = json.dumps(slim, ensure_ascii=False)
+
+    # target_chars=750：让 chunks 数与并行度（3）匹配，单批跑完；
+    # 每段 prompt 约 2.5-3K 字，仍远低于智谱断连阈值
+    chunks = _split_review_into_chunks(review_text, target_chars=750)
+    print(f"[review-match] 节点 {len(slim)} 个，纪要切成 {len(chunks)} 段（共 {len(review_text)} 字），并行调 LLM")
+
+    # 检测每段纪要是否属于「待办事项」类章节（用不同 prompt 处理）
+    def _is_todo_section(text):
+        head = text.lstrip()[:120]
+        kws = ['待办事项', '待办项', '行动项', 'TODO', 'todo', 'Action Items', '后续跟进', '后续事项', 'Next Steps']
+        return any(k in head for k in kws)
+
+    def _build_narrative_prompt(chunk, i, total):
+        """描述性章节 prompt：只产出每页的 1-2 句决议总结，禁止从功能描述里编 todo。"""
+        return f'''你是 UI 评审助手。下面是会议纪要的**描述性章节**——它在描述若干页面的设计/实现共识。
+请把内容映射到对应节点，**只为每个涉及到的页面浓缩出 1-2 句"评审结论"**。
+
+节点列表 (JSON)：
+{node_json}
+
+会议纪要片段（第 {i}/{total} 段，描述性章节）：
+{chunk}
+
+【硬性规则】
+1. **newTodos 必须为空数组 []** —— 此片段不含任何待办事项！描述性章节里的"需 xxx / 支持 xxx / 采用 xxx / 校验 xxx"都是已达成共识的**实现需求**，不是 todo
+2. newConclusion = 该页评审的决议性总结，**1-2 句话**，浓缩多条 spec 的精华
+   - ✅ "保留净值走势和业绩对比，移除基金比较和定投功能。交易前校验登录与 TA 开户。"
+   - ❌ 不要把所有 spec 一条一条罗列
+3. 一段可对应多个节点，但**只输出 matchScore 最高的 1-2 个**——不要把相同结论复制到所有相关子页
+4. 优先选父级容器节点（如「公募基金」整体），少选具体子页（除非内容明确针对某个子页）
+5. matchScore: title 完全相同 0.95+，关键词命中 0.7~0.9
+6. 不要为不同节点输出**相同**的 newConclusion——若两段内容会得到同一句结论，只保留最相关的那个节点
+7. 完全无法匹配的内容不输出
+
+严格输出 JSON 数组（不加代码块、不加解释）：
+[{{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...","newTodos":[],"resolveTodoIds":[]}}]'''
+
+    def _build_todos_prompt(chunk, i, total):
+        """待办章节 prompt：每条 todo 独立匹配到最相关节点。"""
+        return f'''你是 UI 评审助手。下面是会议纪要的**「待办事项」章节**——它列出了会议结束后需要继续跟进的具体动作。
+请把每一条待办独立匹配到最相关的节点。
+
+节点列表 (JSON)：
+{node_json}
+
+会议纪要片段（第 {i}/{total} 段，待办事项章节）：
+{chunk}
+
+【硬性规则】
+1. 每一条待办（通常以 "-" 开头或独立成行）→ 一个 newTodos 项；保留原文（含 "@xxx"），不要改写或合并
+2. 按关键词匹配到最相关的节点（举例：含「天汇宝」的待办 → 匹配 title 含天汇宝的节点；含「交易记录」的 → 交易记录节点）
+3. 同一节点可对应多条 todo
+4. **newConclusion 留空（"" 或 null）** —— 待办章节本身不输出结论
+5. status 默认 "open"；纪要里写明"已解决/已确认"的写 "resolved"
+6. 找不到合适节点的待办，nodeUid 选 title 含 "首页" / "总览" / 根节点的兜底
+7. matchScore: 直接关键词命中 0.85+，主题相关 0.6~0.8
+
+严格输出 JSON 数组（不加代码块、不加解释）：
+[{{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":null,"newTodos":[{{"text":"原文","status":"open"}}],"resolveTodoIds":[]}}]'''
+
+    def _process_chunk(idx_chunk):
+        i, chunk = idx_chunk
+        is_todo = _is_todo_section(chunk)
+        prompt = _build_todos_prompt(chunk, i, len(chunks)) if is_todo else _build_narrative_prompt(chunk, i, len(chunks))
+        print(f"[review-match] 第 {i}/{len(chunks)} 段 mode={'todos' if is_todo else 'narrative'}（{len(chunk)} 字）")
+        try:
+            raw = _call_zhipu_chat(prompt, zhipu_key)
+        except Exception as e:
+            print(f"[review-match] 第 {i}/{len(chunks)} 段失败：{e}，跳过")
+            return []
+        m = re.search(r'\[[\s\S]*\]', raw or '')
+        if not m:
+            print(f"[review-match] 第 {i}/{len(chunks)} 段返回无 JSON: {(raw or '')[:200]}")
+            return []
+        try:
+            arr = json.loads(m.group(0))
+            print(f"[review-match] 第 {i}/{len(chunks)} 段命中 {len(arr) if isinstance(arr, list) else 0} 项")
+            return arr if isinstance(arr, list) else []
+        except Exception as e:
+            print(f"[review-match] 第 {i}/{len(chunks)} 段 JSON 解析失败：{e}")
+            return []
+
+    # 并行：max_workers=3 — 实测下平衡点。再高（4+）反而因偶发 429/RemoteDisconnected
+    # 触发重试导致总耗时反升。429 与连接错误由 _call_zhipu_chat 内部退避兜底。
+    from concurrent.futures import ThreadPoolExecutor
+    indexed = list(enumerate(chunks, 1))
+    all_items = []
+    with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as ex:
+        for arr in ex.map(_process_chunk, indexed):
+            all_items.extend(arr)
+
+    # 合并：同 nodeUid 的多段输出聚合（合并 todos / 取第一个非空 conclusion）
+    valid_uids = {n.get('uid') for n in nodes}
+    merged = {}
+    for it in all_items:
+        if not isinstance(it, dict): continue
+        uid = it.get('nodeUid')
+        if uid not in valid_uids: continue
+        if uid not in merged:
+            merged[uid] = {
+                'nodeUid': uid,
+                'matchScore': float(it.get('matchScore') or 0),
+                'matchReason': str(it.get('matchReason') or ''),
+                'newConclusion': '',
+                'newTodos': [],
+                'resolveTodoIds': [],
+            }
+        m = merged[uid]
+        m['matchScore'] = max(m['matchScore'], float(it.get('matchScore') or 0))
+        if not m['matchReason']:
+            m['matchReason'] = str(it.get('matchReason') or '')
+        # 选第一个非占位的 conclusion
+        c = str(it.get('newConclusion') or '').strip()
+        if c and c not in ('...', '...。', '示例', '...示例...') and not m['newConclusion']:
+            m['newConclusion'] = c
+        for t in (it.get('newTodos') or []):
+            if isinstance(t, dict) and (t.get('text') or '').strip():
+                m['newTodos'].append({
+                    'text': str(t['text']).strip(),
+                    'status': 'resolved' if t.get('status') == 'resolved' else 'open',
+                })
+        for x in (it.get('resolveTodoIds') or []):
+            if x: m['resolveTodoIds'].append(str(x))
+
+    cleaned = []
+    for uid, m in merged.items():
+        if not m['newConclusion']: m['newConclusion'] = None
+        cleaned.append(m)
+    print(f"[review-match] 合并后命中 {len(cleaned)} 个节点（共调 {len(chunks)} 次 LLM）")
+    return cleaned
+
+
 def build_results_from_mapping(targets, ocr_items, mapping):
     """按 target_index → ocr_id 映射构建 results 数组（与字符串匹配输出格式一致）"""
     out = []
@@ -302,10 +529,54 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def _send_json(self, status, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_review_match(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            payload = json.loads(self.rfile.read(length).decode('utf-8'))
+            nodes = payload.get('nodes') or []
+            review_text = payload.get('reviewText') or ''
+            zhipu_key = (
+                payload.get('zhipu_key')
+                or os.environ.get('ZHIPU_API_KEY')
+                or os.environ.get('ANTHROPIC_AUTH_TOKEN')
+                or ''
+            )
+            if not nodes or not review_text.strip():
+                self._send_json(400, {'ok': False, 'error': 'nodes 与 reviewText 都是必填'})
+                return
+            if not zhipu_key:
+                self._send_json(400, {'ok': False, 'error': '服务端无 ZHIPU_API_KEY，且请求未带 zhipu_key'})
+                return
+            print(f"[review-match] 收到 {len(nodes)} 个节点 + {len(review_text)} 字纪要")
+            # 直接返回数组（前端 fetch 后期望 Array）
+            results = match_review_to_nodes(nodes, review_text, zhipu_key)
+            body = json.dumps(results, ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json(500, {'ok': False, 'error': str(e)})
+
     def do_POST(self):
+        if self.path == '/review-match':
+            self._handle_review_match()
+            return
         if self.path != '/ocr-locate':
             self.send_response(404); self._cors(); self.end_headers()
-            self.wfile.write(b'{"error":"POST /ocr-locate only"}')
+            self.wfile.write(b'{"error":"POST /ocr-locate or /review-match only"}')
             return
         try:
             length = int(self.headers.get('Content-Length', 0))
@@ -398,7 +669,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8788
     print(f"✅ MindDeck OCR 定位服务 → http://localhost:{port}")
-    print(f"   接口: POST /ocr-locate")
+    print(f"   接口: POST /ocr-locate · POST /review-match")
     print(f"   切片: {TILE_H}px 高，重叠 {OVERLAP}px")
     print(f"   后端: macOS Vision (ocrmac)")
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)

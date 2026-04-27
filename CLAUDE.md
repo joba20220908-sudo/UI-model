@@ -37,9 +37,10 @@ UI-model/
   Template/              # 模板（开新项目时复制）
     Prototype.html, app.js, data.js, screenshots/, README.md
   Projects/
-    hnw-licai/           # 单文件版（Prototype + app.js + data.js）
+    hnw-licai/           # 单文件版（Prototype + app.js + data.js），XMind 路径产出
+    hnw-licai-docx/      # 单文件版，Word PRD 路径产出（parse-docx.py 生成）
     my-new-project/      # 模块化版（含 MindDeck-standalone.html 内嵌单文件版）
-    移动端个人高净值用户理财测试样例/  # 模块化版（含 .xmind 源文件）
+    移动端个人高净值用户理财测试样例/  # 单文件版（含 .xmind 源文件）
   scripts/
     start.sh             # 一键启动两服务
     ocr-locate-server.py # macOS Vision OCR + 智谱 glm-4-flash 语义匹配
@@ -54,7 +55,7 @@ UI-model/
 
 | 变体 | 特征 | 项目 |
 |---|---|---|
-| **Single-file** | `<script>` 加载顺序 `data.js → locator.js → app.js` | `Template/`、`Projects/hnw-licai/`、根目录调试版、`Projects/移动端个人高净值用户理财测试样例/` |
+| **Single-file** | `<script>` 加载顺序 `data.js → locator.js → app.js` | `Template/`、`Projects/hnw-licai/`、`Projects/hnw-licai-docx/`、根目录调试版、`Projects/移动端个人高净值用户理财测试样例/` |
 | **Modular** | 拆成多个 `.js`，加载顺序见下；`ai.js` 负责 `autolocate*`，AI 内部走 `locator.js` | `Projects/my-new-project/` |
 | **Standalone HTML** | 单文件 HTML 内嵌全部脚本（含 locator.js IIFE 副本，保持自包含）| `Projects/my-new-project/MindDeck-standalone.html` |
 
@@ -178,14 +179,14 @@ python3 scripts/parse-docx.py <input.docx> Projects/<new-project> [--id <id>] [-
 
 - **多变体同步**：现在 AI 逻辑统一走 `Template/locator.js`，6 个变体都用同一份 source。改 AI 只需要：
   - 编辑 `Template/locator.js`
-  - `cp` 到所有 5 个外部副本（root、hnw-licai、移动端样例、my-new-project）
+  - `cp` 到所有 5 个外部副本（root 调试版、`Projects/hnw-licai`、`Projects/hnw-licai-docx`、`Projects/移动端个人高净值用户理财测试样例`、`Projects/my-new-project`）
   - 同步内嵌副本：`my-new-project/MindDeck-standalone.html` 里的 IIFE 块
   - 非 AI 的逻辑改动仍需手工同步到各 `app.js`（Template 是 source of truth）
 - **`scripts/start.sh` 必须 ports 8000 + 8788 都空闲**：脚本会做端口冲突检查并报错；遗留进程用 `lsof -ti :8788 | xargs kill -9` 清。
 - **`scripts/start.sh` 自动从 `~/.claude/settings.json` 读 `ANTHROPIC_AUTH_TOKEN` 当智谱 key**：跨用户使用时要么自己 `export ZHIPU_API_KEY`，要么改脚本。
 - **导入/导出 schema**：`buildExport` / `applyImport` 只接受 JSON 含 `schema: 'minddeck'` 或 `'proto-review'`。
 - **不存在的命令**：曾经的 CLAUDE.md 描述了 `scripts/launch.sh`、`scripts/gen-manifest.js`、`scripts/test-modules.js`、`scripts/verify-images.sh` —— 这些**都未实现**。当前 `scripts/` 有 `start.sh` / `ocr-locate-server.py` / `parse-xmind.js` / `parse-docx.py` / `vision-proxy.js`。
-- **`MindDeck-standalone.html` 跟主线脱节**：内嵌的 app.js / locator.js 是早期快照副本，新加的 tree overrides / 拖拽 / 节点编辑 / 热点编辑都没同步进去。需要时从 `Template/app.js` 重新拷贝整段，或干脆当成只读样本。
+- **`MindDeck-standalone.html` 已是只读历史快照**：内嵌的 app.js / locator.js 是早期副本，tree overrides / 拖拽 / 节点编辑 / 热点编辑等新功能都没同步。**不要再往里增量 patch**——若有强需求，整体从 `Template/` 重写一份新的 standalone，否则视为参考样本。
 
 ## Reference Docs
 
