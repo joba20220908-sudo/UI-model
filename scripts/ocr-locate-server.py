@@ -337,27 +337,65 @@ def match_review_to_nodes(nodes, review_text, zhipu_key):
     chunks = _split_review_into_chunks(review_text, target_chars=750)
     print(f"[review-match] 节点 {len(slim)} 个，纪要切成 {len(chunks)} 段（共 {len(review_text)} 字），并行调 LLM")
 
-    def _process_chunk(idx_chunk):
-        i, chunk = idx_chunk
-        prompt = f'''你是 UI 评审助手。请把会议纪要片段中的评审内容匹配到对应的节点，并提取「评审结论」和「待确认事项」。
+    # 检测每段纪要是否属于「待办事项」类章节（用不同 prompt 处理）
+    def _is_todo_section(text):
+        head = text.lstrip()[:120]
+        kws = ['待办事项', '待办项', '行动项', 'TODO', 'todo', 'Action Items', '后续跟进', '后续事项', 'Next Steps']
+        return any(k in head for k in kws)
+
+    def _build_narrative_prompt(chunk, i, total):
+        """描述性章节 prompt：只产出每页的 1-2 句决议总结，禁止从功能描述里编 todo。"""
+        return f'''你是 UI 评审助手。下面是会议纪要的**描述性章节**——它在描述若干页面的设计/实现共识。
+请把内容映射到对应节点，**只为每个涉及到的页面浓缩出 1-2 句"评审结论"**。
 
 节点列表 (JSON)：
 {node_json}
 
-会议纪要片段（第 {i}/{len(chunks)} 段）：
+会议纪要片段（第 {i}/{total} 段，描述性章节）：
 {chunk}
 
-匹配指引：
-1. 优先按节点 title 与纪要中页面/功能名匹配；title 模糊时参考 note/description
-2. 一段纪要只对应一个节点；若覆盖多页，按段落分别匹配
-3. 「评审结论」= 整页的决议性陈述（如"本页通过"、"按方案 B 修改"）
-4. 「待确认事项」= 具体的待办/疑问（如"按钮文案待 PM 确认"），status="open" 默认
-5. 纪要中明确标注「已解决」「已确认」的待确认事项 → 写到 resolveTodoIds（暂留空）
-6. matchScore: 0~1，title 完全相同 0.95+，关键词命中 0.7~0.9，弱推断 0.5~0.7
-7. 完全无法匹配的段落不输出
+【硬性规则】
+1. **newTodos 必须为空数组 []** —— 此片段不含任何待办事项！描述性章节里的"需 xxx / 支持 xxx / 采用 xxx / 校验 xxx"都是已达成共识的**实现需求**，不是 todo
+2. newConclusion = 该页评审的决议性总结，**1-2 句话**，浓缩多条 spec 的精华
+   - ✅ "保留净值走势和业绩对比，移除基金比较和定投功能。交易前校验登录与 TA 开户。"
+   - ❌ 不要把所有 spec 一条一条罗列
+3. 一段可对应多个节点，但**只输出 matchScore 最高的 1-2 个**——不要把相同结论复制到所有相关子页
+4. 优先选父级容器节点（如「公募基金」整体），少选具体子页（除非内容明确针对某个子页）
+5. matchScore: title 完全相同 0.95+，关键词命中 0.7~0.9
+6. 不要为不同节点输出**相同**的 newConclusion——若两段内容会得到同一句结论，只保留最相关的那个节点
+7. 完全无法匹配的内容不输出
 
 严格输出 JSON 数组（不加代码块、不加解释）：
-[{{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...","newTodos":[{{"text":"...","status":"open"}}],"resolveTodoIds":[]}}]'''
+[{{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":"...","newTodos":[],"resolveTodoIds":[]}}]'''
+
+    def _build_todos_prompt(chunk, i, total):
+        """待办章节 prompt：每条 todo 独立匹配到最相关节点。"""
+        return f'''你是 UI 评审助手。下面是会议纪要的**「待办事项」章节**——它列出了会议结束后需要继续跟进的具体动作。
+请把每一条待办独立匹配到最相关的节点。
+
+节点列表 (JSON)：
+{node_json}
+
+会议纪要片段（第 {i}/{total} 段，待办事项章节）：
+{chunk}
+
+【硬性规则】
+1. 每一条待办（通常以 "-" 开头或独立成行）→ 一个 newTodos 项；保留原文（含 "@xxx"），不要改写或合并
+2. 按关键词匹配到最相关的节点（举例：含「天汇宝」的待办 → 匹配 title 含天汇宝的节点；含「交易记录」的 → 交易记录节点）
+3. 同一节点可对应多条 todo
+4. **newConclusion 留空（"" 或 null）** —— 待办章节本身不输出结论
+5. status 默认 "open"；纪要里写明"已解决/已确认"的写 "resolved"
+6. 找不到合适节点的待办，nodeUid 选 title 含 "首页" / "总览" / 根节点的兜底
+7. matchScore: 直接关键词命中 0.85+，主题相关 0.6~0.8
+
+严格输出 JSON 数组（不加代码块、不加解释）：
+[{{"nodeUid":"n3","matchScore":0.9,"matchReason":"...","newConclusion":null,"newTodos":[{{"text":"原文","status":"open"}}],"resolveTodoIds":[]}}]'''
+
+    def _process_chunk(idx_chunk):
+        i, chunk = idx_chunk
+        is_todo = _is_todo_section(chunk)
+        prompt = _build_todos_prompt(chunk, i, len(chunks)) if is_todo else _build_narrative_prompt(chunk, i, len(chunks))
+        print(f"[review-match] 第 {i}/{len(chunks)} 段 mode={'todos' if is_todo else 'narrative'}（{len(chunk)} 字）")
         try:
             raw = _call_zhipu_chat(prompt, zhipu_key)
         except Exception as e:
