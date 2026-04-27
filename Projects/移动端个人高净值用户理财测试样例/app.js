@@ -2924,24 +2924,99 @@ function setupZoom() {
   }
 }
 
+// 关闭所有下拉并同步 aria-expanded（except 不动）。集中在一处避免遗漏。
+function closeAllDropdowns(except) {
+  document.querySelectorAll('.tbtn-menu').forEach(m => {
+    if (m === except || m.hidden) return;
+    m.hidden = true;
+    const trigger = document.querySelector(`[aria-controls="${m.id}"]`);
+    if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  });
+}
+
 function setupDropdown(buttonId, menuId) {
   const btn = document.getElementById(buttonId);
   const menu = document.getElementById(menuId);
   if (!btn || !menu) return;
+
+  // 给菜单项标 role + tabindex（HTML 上只标了 role="menu"，避免在每个 li 重复手写）
+  menu.querySelectorAll('li[data-act]').forEach(li => {
+    li.setAttribute('role', 'menuitem');
+    if (!li.hasAttribute('tabindex')) li.setAttribute('tabindex', '-1');
+  });
+  menu.querySelectorAll('li.sep').forEach(li => li.setAttribute('role', 'separator'));
+
+  const items = () => Array.from(menu.querySelectorAll('li[data-act]:not(.disabled)'));
+
+  function open(focusTarget /* 'first' | 'last' | null */) {
+    closeAllDropdowns(menu);
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+    const list = items();
+    if (focusTarget === 'first') list[0]?.focus();
+    else if (focusTarget === 'last') list[list.length - 1]?.focus();
+  }
+  function close(returnFocus) {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+    if (returnFocus) btn.focus();
+  }
+
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
-    // 关闭其他下拉
-    document.querySelectorAll('.tbtn-menu').forEach(m => { if (m !== menu) m.hidden = true; });
-    menu.hidden = !menu.hidden;
+    if (menu.hidden) open(null); else close(false);
   });
+
+  // 触发按钮键盘：↓ / Enter / Space → 打开并聚焦首项；↑ → 打开并聚焦末项
+  btn.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault(); e.stopPropagation();
+      open('first');
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault(); e.stopPropagation();
+      open('last');
+    }
+  });
+
   menu.addEventListener('click', (e) => {
     const li = e.target.closest('li[data-act]');
-    if (!li) return;
-    if (li.classList.contains('disabled')) return;
+    if (!li || li.classList.contains('disabled')) return;
     const act = li.dataset.act;
-    menu.hidden = true;
+    close(false);
     const fn = TOOLBAR_ACTIONS[act];
     if (fn) fn();
+  });
+
+  // 菜单内键盘导航：↑↓ 循环 / Home End / Esc 关闭并回焦 / Enter Space 触发 / Tab 关闭并继续 tab
+  menu.addEventListener('keydown', (e) => {
+    const list = items();
+    const idx = list.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault(); e.stopPropagation();
+      list[(idx + 1 + list.length) % list.length]?.focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault(); e.stopPropagation();
+      list[(idx - 1 + list.length) % list.length]?.focus();
+    } else if (e.key === 'Home') {
+      e.preventDefault(); e.stopPropagation();
+      list[0]?.focus();
+    } else if (e.key === 'End') {
+      e.preventDefault(); e.stopPropagation();
+      list[list.length - 1]?.focus();
+    } else if (e.key === 'Escape') {
+      e.preventDefault(); e.stopPropagation();
+      close(true);
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault(); e.stopPropagation();
+      if (idx >= 0) list[idx].click();
+    } else if (e.key === 'Tab') {
+      // Tab 关闭菜单但允许浏览器继续移动焦点（不 preventDefault）
+      close(false);
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      // 拦住，避免冒泡到 window 触发原型左右翻页
+      e.stopPropagation();
+    }
   });
 }
 
@@ -2975,19 +3050,20 @@ function setupToolbar() {
   });
 
   // 点击外部关闭所有下拉
-  document.addEventListener('click', () => {
-    document.querySelectorAll('.tbtn-menu').forEach(m => { m.hidden = true; });
-  });
+  document.addEventListener('click', () => closeAllDropdowns(null));
 
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    // 焦点在菜单内时，菜单的 keydown 已自行处理并 stopPropagation。
+    // 这里再加一道兜底，防止 ArrowUp 等漏到全局后误触父级跳转。
+    if (e.target.closest && e.target.closest('.tbtn-menu')) return;
     if (e.key === 'ArrowLeft') document.getElementById('btn-prev').click();
     else if (e.key === 'ArrowRight') document.getElementById('btn-next').click();
     else if (e.key === 'ArrowUp') document.getElementById('btn-parent').click();
     else if (e.key === 'h' || e.key === 'H') toggleHotspots();
     else if (e.key === 'c' || e.key === 'C') document.getElementById('btn-comment-mode').click();
     else if (e.key === 'Escape') {
-      document.querySelectorAll('.tbtn-menu').forEach(m => { m.hidden = true; });
+      closeAllDropdowns(null);
       closeAllPopovers();
     }
   });
