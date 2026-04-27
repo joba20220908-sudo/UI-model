@@ -1985,7 +1985,7 @@ async function exportReviewDoc(format) {
   }
 
   if (format === 'docx') {
-    exportReviewMarkdown(nodes, allComments, allReview);
+    await exportReviewDocxOrFallback(nodes, allComments, allReview);
     return;
   }
 
@@ -2053,7 +2053,7 @@ async function nodeImageToBase64(node) {
   return null;
 }
 
-function exportReviewMarkdown(nodes, allComments, allReview) {
+function buildReviewMarkdown(nodes, allComments, allReview) {
   const projectTitle = META.title || PROJECT_ID;
   const now = new Date().toLocaleString('zh-CN');
   const lines = [`# ${projectTitle} 评审纪要`, '', `> 导出时间：${now}`, ''];
@@ -2077,16 +2077,50 @@ function exportReviewMarkdown(nodes, allComments, allReview) {
     }
     lines.push('---', '');
   }
+  return lines.join('\n');
+}
 
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
-  const pid = projectTitle.replace(/[\s\/\\:]/g, '-');
-  const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url; a.download = `MindDeck-${pid}-纪要-${ts}.md`;
+  a.href = url; a.download = filename;
   document.body.appendChild(a); a.click();
   setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 0);
-  showToast('已下载 Markdown 格式纪要。可拖到 Claude Code，让它用 python-docx 转为正式 .docx');
+}
+
+// 优先调本地服务一键转 .docx；服务不可达 / 失败时回退到 .md 下载并提示。
+async function exportReviewDocxOrFallback(nodes, allComments, allReview) {
+  const projectTitle = META.title || PROJECT_ID;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
+  const pid = projectTitle.replace(/[\s\/\\:]/g, '-');
+  const baseName = `MindDeck-${pid}-纪要-${ts}`;
+  const md = buildReviewMarkdown(nodes, allComments, allReview);
+
+  // 走本地 OCR 服务的 /md-to-docx 端点（python-docx）
+  try {
+    const resp = await fetch('http://localhost:8788/md-to-docx', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ markdown: md, filename: baseName + '.docx' }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (resp.ok) {
+      const blob = await resp.blob();
+      downloadBlob(blob, baseName + '.docx');
+      showToast(`评审纪要已导出 .docx（${nodes.length} 个页面）`);
+      return;
+    }
+    // 服务返回但失败：记错误信息，回退 md
+    const errBody = await resp.text().catch(() => '');
+    console.warn(`[md-to-docx] 服务端 ${resp.status}: ${errBody}`);
+  } catch (e) {
+    console.warn('[md-to-docx] 本地服务不可达', e);
+  }
+
+  // Fallback: 下载 markdown
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  downloadBlob(blob, baseName + '.md');
+  showToast('本地服务未启动，已下载 markdown。跑 `bash scripts/start.sh` 后重试可一键导出 .docx');
 }
 
 function buildReviewHtml({ nodes, allComments, allReview, hsAll, imageMap, stats }) {

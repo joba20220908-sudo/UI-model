@@ -53,6 +53,16 @@ except ImportError as e:
     print(f"❌ 缺依赖: {e}\n请跑: pip3 install --user ocrmac pillow", file=sys.stderr)
     sys.exit(1)
 
+# python-docx 是软依赖：仅 /md-to-docx endpoint 需要
+# 缺失时该 endpoint 返回 501，其余功能不受影响
+try:
+    import docx as _docx_lib
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    _DOCX_AVAILABLE = True
+except ImportError:
+    _DOCX_AVAILABLE = False
+
 
 # 切片参数：单片不超过 1500×∞，重叠 200，避免长图漏识别
 TILE_H = 1500
@@ -518,6 +528,78 @@ def match_targets(ocr_results, targets):
     return out
 
 
+# ─────────────────────────── /md-to-docx ───────────────────────────
+# 极简 markdown → .docx 转换。只覆盖 exportReviewMarkdown() 实际产出的子集：
+#   # / ## / ### 标题、`> 引用、`---` 分割线、`- [ ] / - [x]` 任务、
+#   `- ` 普通项、行首到行尾的 **加粗** 内联片段、空行 = 段落分隔
+# 不做通用 markdown 解析（链接 / 代码块 / 表格 / 图片等不出现在我们 MD 输出里）。
+
+_MD_BOLD_RE = re.compile(r'(\*\*[^*]+\*\*)')
+
+def _docx_add_inline(p, text):
+    """在段落里按 **xxx** 拆分加粗 / 普通 run。"""
+    for part in _MD_BOLD_RE.split(text):
+        if not part:
+            continue
+        if part.startswith('**') and part.endswith('**') and len(part) >= 4:
+            run = p.add_run(part[2:-2])
+            run.bold = True
+        else:
+            p.add_run(part)
+
+def _docx_add_hr(doc):
+    """加一条横线（`---` 在 Word 里没有原生对等物，用底边框模拟）。"""
+    p = doc.add_paragraph()
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement('w:pBdr')
+    bottom = OxmlElement('w:bottom')
+    bottom.set(qn('w:val'), 'single')
+    bottom.set(qn('w:sz'), '6')
+    bottom.set(qn('w:space'), '1')
+    bottom.set(qn('w:color'), 'auto')
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+def md_to_docx_bytes(md_text):
+    """转换并返回 .docx bytes。md_text 是上面注释里描述的子集。"""
+    doc = _docx_lib.Document()
+    for raw_line in md_text.split('\n'):
+        line = raw_line.rstrip()
+        if not line:
+            # 空行：python-docx 默认每个 add_paragraph 已经分段，这里跳过避免堆出连续空行
+            continue
+        if line.startswith('### '):
+            doc.add_heading(line[4:].strip(), level=3)
+        elif line.startswith('## '):
+            doc.add_heading(line[3:].strip(), level=2)
+        elif line.startswith('# '):
+            doc.add_heading(line[2:].strip(), level=1)
+        elif line.strip() == '---':
+            _docx_add_hr(doc)
+        elif line.startswith('> '):
+            p = doc.add_paragraph()
+            try:
+                p.style = doc.styles['Intense Quote']
+            except KeyError:
+                pass  # 某些 Word 模板没这个 style，退回默认
+            _docx_add_inline(p, line[2:].strip())
+        elif line.startswith('- [x] ') or line.startswith('- [X] '):
+            p = doc.add_paragraph(style='List Bullet')
+            _docx_add_inline(p, '☑ ' + line[6:].strip())
+        elif line.startswith('- [ ] '):
+            p = doc.add_paragraph(style='List Bullet')
+            _docx_add_inline(p, '☐ ' + line[6:].strip())
+        elif line.startswith('- '):
+            p = doc.add_paragraph(style='List Bullet')
+            _docx_add_inline(p, line[2:].strip())
+        else:
+            p = doc.add_paragraph()
+            _docx_add_inline(p, line)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # 简洁日志
@@ -574,13 +656,48 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self._send_json(500, {'ok': False, 'error': str(e)})
 
+    def _handle_md_to_docx(self):
+        if not _DOCX_AVAILABLE:
+            self._send_json(501, {'ok': False, 'error': '服务端缺少 python-docx，请跑 pip3 install --user python-docx 后重启服务'})
+            return
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            payload = json.loads(self.rfile.read(length).decode('utf-8'))
+            md_text = payload.get('markdown') or ''
+            filename = payload.get('filename') or 'export.docx'
+            if not md_text.strip():
+                self._send_json(400, {'ok': False, 'error': 'markdown 字段必填'})
+                return
+            print(f"[md-to-docx] 收到 {len(md_text)} 字 markdown")
+            data = md_to_docx_bytes(md_text)
+            # 中文文件名走 RFC 5987 filename* 编码，ASCII fallback 写到 filename 让老客户端兜底
+            from urllib.parse import quote
+            ascii_fallback = re.sub(r'[^\x20-\x7e]', '_', filename) or 'export.docx'
+            disp = (
+                f'attachment; filename="{ascii_fallback}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+            self.send_header('Content-Disposition', disp)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json(500, {'ok': False, 'error': str(e)})
+
     def do_POST(self):
         if self.path == '/review-match':
             self._handle_review_match()
             return
+        if self.path == '/md-to-docx':
+            self._handle_md_to_docx()
+            return
         if self.path != '/ocr-locate':
             self.send_response(404); self._cors(); self.end_headers()
-            self.wfile.write(b'{"error":"POST /ocr-locate or /review-match only"}')
+            self.wfile.write(b'{"error":"POST /ocr-locate, /review-match, or /md-to-docx only"}')
             return
         try:
             length = int(self.headers.get('Content-Length', 0))
