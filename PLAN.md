@@ -88,7 +88,7 @@ todoCount: { open: ..., resolved: ... }  // 仅元数据，便于纪要文档摘
 - Modal：粘贴纪要文本 / 上传 .md / .txt / .docx 文件
 - 提交后调用 `matchReviewToNodes(text)`：
   1. 收集 `PROTOTYPE_TREE` 所有节点的 `{uid, title, rawTitle, note, description}` 作为索引
-  2. POST 到本地 OCR 服务的新端点 `/review-match`（见下文 #3）或直连智谱 `glm-4.6`
+  2. POST 到本地 OCR 服务的新端点 `/review-match`（见下文 #3）或直连智谱 `glm-4-flash`（实测：长 prompt 下 `glm-4.6` reasoning 通道易"Remote end closed"，已切回 flash）
   3. LLM 输出：
      ```json
      [
@@ -156,7 +156,7 @@ todoCount: { open: ..., resolved: ... }  // 仅元数据，便于纪要文档摘
 ### 3. `scripts/ocr-locate-server.py` — 新增 `/review-match` 端点
 - 复用现有 zhipu 调用代码（参考 OCR 服务里现有的 `glm-4-flash` 语义匹配）
 - POST body：`{ nodes: [{uid, title, note, description, hasImage}], reviewText: string }`
-- 用 `glm-4.6`（这里是文本任务，长 prompt 可接受；OCR 服务的 reasoning 限制只针对图片切片场景）
+- 用 `glm-4-flash`（实测：`glm-4.6` reasoning 通道处理 4K+ 字中文 prompt 时容易触发 "Remote end closed connection without response"；flash 通道稳定，且按章节切分后单段 prompt < 3K 字，匹配质量足够。详见 `scripts/ocr-locate-server.py` 顶部注释）
 - 服务不可达时前端 fallback 到直连智谱（复用 `locator.js` 里的 `minddeck:zhipu_key` 用户 key 路径）
 
 ### 4. 多变体同步

@@ -331,6 +331,8 @@ def match_review_to_nodes(nodes, review_text, zhipu_key):
     # 反而会触发智谱长 prompt 断连。LLM 仅靠 title 就能匹配大部分场景。
     slim = [{'uid': n.get('uid'), 'title': n.get('title')} for n in nodes[:80]]
     node_json = json.dumps(slim, ensure_ascii=False)
+    if len(nodes) > 80:
+        print(f"[review-match] WARNING: 节点数 {len(nodes)} > 80，仅前 80 个参与匹配（按 PROTOTYPE_TREE 树序），其余将被静默丢弃")
 
     # target_chars=750：让 chunks 数与并行度（3）匹配，单批跑完；
     # 每段 prompt 约 2.5-3K 字，仍远低于智谱断连阈值
@@ -443,8 +445,10 @@ def match_review_to_nodes(nodes, review_text, zhipu_key):
         if not m['matchReason']:
             m['matchReason'] = str(it.get('matchReason') or '')
         # 选第一个非占位的 conclusion
+        # 长度 + strip 检查比黑名单稳健：移除省略号 / 空白后实长 < 4 的视为占位
         c = str(it.get('newConclusion') or '').strip()
-        if c and c not in ('...', '...。', '示例', '...示例...') and not m['newConclusion']:
+        c_core = c.strip('.…。 \t')
+        if c and len(c_core) >= 4 and c_core != '示例' and not m['newConclusion']:
             m['newConclusion'] = c
         for t in (it.get('newTodos') or []):
             if isinstance(t, dict) and (t.get('text') or '').strip():

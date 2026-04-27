@@ -2534,10 +2534,14 @@ async function matchReviewToNodes(reviewText) {
       body: JSON.stringify({ nodes: nodeList.slice(0, 80), reviewText }),
     });
     serverReached = true;
-    const data = await resp.json().catch(() => null);
+    let data = null;
+    let parseFailed = false;
+    try { data = await resp.json(); } catch { parseFailed = true; }
     if (resp.ok && Array.isArray(data)) return data; // 数组（含空数组）都视为有效结果
     // 服务端报错但能联通 → 透传错误，不再 fallback（fallback 会被 CORS 拦截，徒增混乱）
-    const msg = data && data.error ? data.error : `HTTP ${resp.status}`;
+    const msg = (data && data.error)
+      ? data.error
+      : (parseFailed ? `HTTP ${resp.status}（响应非 JSON）` : `HTTP ${resp.status}`);
     throw new Error(`本地服务返回错误：${msg}`);
   } catch (e) {
     if (serverReached) throw e;
@@ -2668,7 +2672,7 @@ function showReviewMatchCandidates(matches) {
       (m.newTodos || []).forEach((t, ti) => {
         if (!overlay.querySelector(`#rv-todo-${i}-${ti}`)?.checked) return;
         curList.push({
-          id: 'c_' + now + '_' + Math.random().toString(36).slice(2, 6),
+          id: 'c_' + now + '_' + i + '_' + ti + '_' + Math.random().toString(36).slice(2, 6),
           xPct: 50, yPct: 50, text: t.text,
           status: t.status || 'open', kind: 'todo',
           createdAt: now, updatedAt: now,
