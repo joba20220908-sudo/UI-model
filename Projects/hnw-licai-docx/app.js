@@ -2785,6 +2785,141 @@ function toggleHotspots() {
   document.getElementById('stage').classList.toggle('hotspots-hidden', !HOTSPOTS_VISIBLE);
 }
 
+// ===== 三栏可拖拽 =====
+// 关键决策：
+// - 通过修改 :root 上的 CSS 变量 --col-left / --col-right 来改宽度，
+//   因为 .app 的 grid-template-columns 已经引用这两个变量。这样拖动只
+//   触发样式重计算，不触发布局重建（如改 grid-template 字符串本身）。
+// - setPointerCapture 让 pointer 即便飞出 splitter 仍能继续触发 move/up，
+//   是拖拽组件的标配；普通 mousemove 会在 splitter 边界丢事件。
+// - body.is-resizing-cols 类在拖动期间应用，强制全局光标为 col-resize，
+//   规避 hover 子元素时光标变形带来的"拖到一半好像断了"的错觉。
+const LAYOUT_KEY = 'minddeck:layout_v1'; // 全局（不带项目前缀）：UI 偏好不属于具体项目
+const COL_MIN = { left: 180, right: 220 };
+const COL_MAX = { left: 520, right: 560 };
+const COL_DEFAULT = { left: 280, right: 320 };
+
+function setupSplitters() {
+  const root = document.documentElement;
+  // 1) 启动时恢复用户上次拖出来的宽度
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}');
+    if (typeof saved.left === 'number') root.style.setProperty('--col-left', saved.left + 'px');
+    if (typeof saved.right === 'number') root.style.setProperty('--col-right', saved.right + 'px');
+  } catch {}
+
+  document.querySelectorAll('.splitter').forEach(sp => {
+    const which = sp.dataset.splitter; // 'left' | 'right'
+    const cssVar = which === 'left' ? '--col-left' : '--col-right';
+
+    // 双击 = 重置该侧到默认
+    sp.addEventListener('dblclick', () => {
+      root.style.setProperty(cssVar, COL_DEFAULT[which] + 'px');
+      persist();
+    });
+
+    sp.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      sp.setPointerCapture(e.pointerId); // 锁定后续 pointer 事件到该元素
+      sp.classList.add('dragging');
+      document.body.classList.add('is-resizing-cols');
+
+      // 起始：从计算样式拿当前 grid 列宽（getComputedStyle 总返回 px）
+      const startX = e.clientX;
+      const cs = getComputedStyle(document.querySelector('.app'));
+      const cols = cs.gridTemplateColumns.split(' '); // [left, splitter, center, splitter, right]
+      const startLeft = parseFloat(cols[0]);
+      const startRight = parseFloat(cols[4]);
+
+      const onMove = ev => {
+        const dx = ev.clientX - startX;
+        if (which === 'left') {
+          // 左 splitter：右移 dx → 左栏变宽
+          const w = Math.max(COL_MIN.left, Math.min(COL_MAX.left, startLeft + dx));
+          root.style.setProperty('--col-left', w + 'px');
+        } else {
+          // 右 splitter：右移 dx → 右栏变窄（dx 取反）
+          const w = Math.max(COL_MIN.right, Math.min(COL_MAX.right, startRight - dx));
+          root.style.setProperty('--col-right', w + 'px');
+        }
+      };
+      const onUp = () => {
+        sp.classList.remove('dragging');
+        document.body.classList.remove('is-resizing-cols');
+        sp.removeEventListener('pointermove', onMove);
+        sp.removeEventListener('pointerup', onUp);
+        sp.removeEventListener('pointercancel', onUp);
+        persist();
+      };
+      sp.addEventListener('pointermove', onMove);
+      sp.addEventListener('pointerup', onUp);
+      sp.addEventListener('pointercancel', onUp);
+    });
+  });
+
+  function persist() {
+    const cs = getComputedStyle(document.querySelector('.app'));
+    const cols = cs.gridTemplateColumns.split(' ');
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({
+      left: Math.round(parseFloat(cols[0])),
+      right: Math.round(parseFloat(cols[4])),
+    }));
+  }
+}
+
+// ===== 中间舞台缩放（演示/投屏场景） =====
+// 关键决策：
+// - 用 CSS transform: scale(var(--zoom)) 而不是直接改 width/height —— 单一旋钮，子元素的 % 定位、字体、padding
+//   全部按比例缩放，零额外代码
+// - 现有热点拖拽用 (clientX - rect.left) / rect.width * 100 算百分比，scale 下分子分母同步缩放，比值不变 → 拖拽无误差
+// - 通过 .device 的 margin-bottom: calc((--zoom - 1) * 714px) 给纵向 overflow 留出空间，让 stage-body 的 auto
+//   产生滚动条；不这么做 transform 不影响 layout box，scale 出去的部分会被裁掉看不见
+const ZOOM_KEY = 'minddeck:zoom_v1'; // 全局：投屏会议希望跨项目复用一个倍率
+const ZOOM_MIN = 0.5, ZOOM_MAX = 2.5, ZOOM_STEP = 0.1;
+
+function setupZoom() {
+  const root = document.documentElement;
+  const label = document.getElementById('zoom-label');
+
+  let z = parseFloat(localStorage.getItem(ZOOM_KEY) || '1') || 1;
+  apply(z);
+
+  function apply(v) {
+    v = Math.round(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, v)) * 100) / 100; // 量化到 0.01
+    z = v;
+    root.style.setProperty('--zoom', String(v));
+    if (label) label.textContent = Math.round(v * 100) + '%';
+    localStorage.setItem(ZOOM_KEY, String(v));
+  }
+
+  document.getElementById('btn-zoom-in').addEventListener('click', () => apply(z + ZOOM_STEP));
+  document.getElementById('btn-zoom-out').addEventListener('click', () => apply(z - ZOOM_STEP));
+  // 点击 100% 文字 = 重置
+  if (label) label.addEventListener('click', () => apply(1));
+
+  // 键盘：Cmd/Ctrl + +/-/0（仅当焦点不在 input/textarea 时）
+  window.addEventListener('keydown', e => {
+    const isMod = e.metaKey || e.ctrlKey;
+    if (!isMod) return;
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); apply(z + ZOOM_STEP); }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); apply(z - ZOOM_STEP); }
+    else if (e.key === '0') { e.preventDefault(); apply(1); }
+  });
+
+  // Ctrl/Cmd + 滚轮：在 stage-body 上滚轮缩放
+  const stageBody = document.querySelector('.stage-body');
+  if (stageBody) {
+    stageBody.addEventListener('wheel', e => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      // deltaY < 0 = 上滚 = 放大；用 0.1 步长配合滚轮的连续性，体验更顺滑
+      apply(z + (e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP));
+    }, { passive: false }); // passive:false 才能 preventDefault
+  }
+}
+
 function setupDropdown(buttonId, menuId) {
   const btn = document.getElementById(buttonId);
   const menu = document.getElementById(menuId);
@@ -3143,6 +3278,8 @@ async function autolocateAll() {
 renderTree();
 setupSearch();
 setupToolbar();
+setupSplitters();
+setupZoom();
 
 const restored = (() => {
   try { return localStorage.getItem(LS_PREFIX + 'current'); } catch { return null; }

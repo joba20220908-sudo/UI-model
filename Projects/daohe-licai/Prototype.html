@@ -30,16 +30,43 @@
     -webkit-font-smoothing: antialiased;
   }
 
-  /* ===== 三栏布局 ===== */
+  /* ===== 三栏布局（中间两条 splitter 是 5px 的网格轨道，可拖拽改 col 宽度） ===== */
   .app {
     display: grid;
-    grid-template-columns: 280px minmax(0, 1fr) 320px;
+    /* 5 条轨道：左栏 | splitter | 中间(吸收剩余) | splitter | 右栏 */
+    grid-template-columns:
+      var(--col-left, 280px)
+      5px
+      minmax(0, 1fr)
+      5px
+      var(--col-right, 320px);
     height: 100vh;
     width: 100vw;
   }
   @media (max-width: 1200px) {
-    .app { grid-template-columns: 240px minmax(0, 1fr) 280px; }
+    .app {
+      grid-template-columns:
+        var(--col-left, 240px)
+        5px
+        minmax(0, 1fr)
+        5px
+        var(--col-right, 280px);
+    }
   }
+  /* splitter 自己 = 一条网格轨道，全高，hover/拖动时高亮 */
+  .splitter {
+    background: var(--line);
+    cursor: col-resize;
+    user-select: none;
+    transition: background .12s;
+    position: relative;
+    z-index: 10;
+  }
+  .splitter:hover { background: var(--accent-dim); }
+  .splitter.dragging { background: var(--accent); }
+  /* 拖动时禁掉文字选中 + 给所有元素设 col-resize 光标，避免飞出 splitter 后光标变形 */
+  body.is-resizing-cols { cursor: col-resize; user-select: none; }
+  body.is-resizing-cols * { cursor: col-resize !important; }
 
   /* ===== 左:大纲树 ===== */
   .sidebar {
@@ -346,7 +373,45 @@
     width: 330px;
     flex-shrink: 0;
     position: relative;
+    transform: scale(var(--zoom, 1));
+    transform-origin: top center;
+    transition: transform .12s ease-out;
+    /* 当 zoom > 1 时，给底部留出 scale 撑出来的额外像素，让 stage-body 的 overflow:auto 产生纵向滚动条 */
+    margin-bottom: calc((var(--zoom, 1) - 1) * 714px);
   }
+  /* 工具栏 zoom 控件 */
+  .zoom-grp {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 1px;
+    flex-shrink: 0;
+  }
+  .zoom-grp .zbtn {
+    background: transparent;
+    border: none;
+    color: var(--fg-dim);
+    width: 22px;
+    height: 22px;
+    font-size: 13px;
+    cursor: pointer;
+    border-radius: 3px;
+    line-height: 1;
+    padding: 0;
+  }
+  .zoom-grp .zbtn:hover { color: var(--fg); background: var(--bg-3); }
+  .zoom-grp .zlabel {
+    min-width: 38px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--fg-dim);
+    cursor: pointer;
+    user-select: none;
+  }
+  .zoom-grp .zlabel:hover { color: var(--fg); }
   .device-frame {
     width: 330px;
     height: 714px;
@@ -395,7 +460,8 @@
   }
   .statusbar .icons { display: flex; gap: 5px; align-items: center; }
   .statusbar svg { display: block; }
-  /* HTML 模拟的 iPhone 缺口 + 状态栏：默认隐藏，避免与截图自带状态栏重叠 */
+  /* HTML 模拟的 iPhone 缺口 + 状态栏：默认隐藏，避免与截图自带状态栏重叠。
+     若某个项目截图是裁切过、没有状态栏的，可在 .device-screen 上加 .show-chrome 类 */
   .device-screen .notch,
   .device-screen .statusbar { display: none; }
   .device-screen.show-chrome .notch { display: block; }
@@ -1161,11 +1227,23 @@
     <div class="tree" id="tree"></div>
   </aside>
 
+  <!-- 拖拽分隔条（左栏 ↔ 中间） -->
+  <div class="splitter" data-splitter="left" title="拖动调整左栏宽度（双击重置）"></div>
+
   <!-- 中间舞台 -->
   <main class="stage" id="stage">
     <div class="stage-toolbar">
       <div class="crumb" id="crumb"></div>
       <div class="toolbar-btns">
+        <!-- 缩放（演示/投屏场景） -->
+        <div class="zoom-grp" title="缩放截图（Cmd/Ctrl + +/-/0；Ctrl 滚轮）">
+          <button class="zbtn" id="btn-zoom-out">−</button>
+          <span class="zlabel" id="zoom-label" title="点击重置">100%</span>
+          <button class="zbtn" id="btn-zoom-in">+</button>
+        </div>
+
+        <span class="tbtn-sep"></span>
+
         <!-- AI 组 -->
         <div class="tbtn-group">
           <button class="tbtn" id="btn-ai-menu" title="AI 识别热点">🔍 AI ▾</button>
@@ -1238,6 +1316,9 @@
       </div>
     </div>
   </main>
+
+  <!-- 拖拽分隔条（中间 ↔ 右栏） -->
+  <div class="splitter" data-splitter="right" title="拖动调整右栏宽度（双击重置）"></div>
 
   <!-- 右侧备注面板 -->
   <aside class="inspector" id="inspector">
