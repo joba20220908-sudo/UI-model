@@ -354,6 +354,13 @@
     white-space: nowrap;
   }
   .tbtn-menu li:hover { background: var(--bg-2); color: var(--fg); }
+  .tbtn-menu li[role="menuitem"]:focus {
+    background: var(--bg-2);
+    color: var(--fg);
+    outline: 2px solid #3b82f6;
+    outline-offset: -2px;
+  }
+  .tbtn-menu li[role="menuitem"]:focus:not(:focus-visible) { outline: none; }
   .tbtn-menu li.sep {
     height: 1px;
     padding: 0;
@@ -1374,8 +1381,8 @@
 
         <!-- AI 组 -->
         <div class="tbtn-group">
-          <button class="tbtn" id="btn-ai-menu" title="AI 识别热点">🔍 AI ▾</button>
-          <ul class="tbtn-menu" id="dd-ai" hidden>
+          <button class="tbtn" id="btn-ai-menu" title="AI 识别热点" aria-haspopup="menu" aria-expanded="false" aria-controls="dd-ai">🔍 AI ▾</button>
+          <ul class="tbtn-menu" id="dd-ai" role="menu" aria-labelledby="btn-ai-menu" hidden>
             <li data-act="ai-current">🎯 识别当前页热点</li>
             <li data-act="ai-batch">📦 批量识别所有父页</li>
           </ul>
@@ -1391,8 +1398,8 @@
 
         <!-- 热点组 -->
         <div class="tbtn-group">
-          <button class="tbtn" id="btn-hotspot-menu" title="热点操作">⊞ 热点 ▾</button>
-          <ul class="tbtn-menu" id="dd-hotspot" hidden>
+          <button class="tbtn" id="btn-hotspot-menu" title="热点操作" aria-haspopup="menu" aria-expanded="false" aria-controls="dd-hotspot">⊞ 热点 ▾</button>
+          <ul class="tbtn-menu" id="dd-hotspot" role="menu" aria-labelledby="btn-hotspot-menu" hidden>
             <li data-act="hs-toggle">👁 显示 / 隐藏热点 (H)</li>
             <li data-act="hs-add">➕ 拖框新增热点</li>
           </ul>
@@ -1402,8 +1409,8 @@
 
         <!-- 数据组（含纪要） -->
         <div class="tbtn-group">
-          <button class="tbtn" id="btn-data-menu" title="数据 · 纪要">📁 数据 ▾</button>
-          <ul class="tbtn-menu" id="dd-data" hidden>
+          <button class="tbtn" id="btn-data-menu" title="数据 · 纪要" aria-haspopup="menu" aria-expanded="false" aria-controls="dd-data">📁 数据 ▾</button>
+          <ul class="tbtn-menu" id="dd-data" role="menu" aria-labelledby="btn-data-menu" hidden>
             <li data-act="export-json">📤 导出原型数据 (JSON)</li>
             <li data-act="import-json">📥 导入原型数据 (JSON)</li>
             <li class="sep"></li>

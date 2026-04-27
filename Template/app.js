@@ -1985,7 +1985,7 @@ async function exportReviewDoc(format) {
   }
 
   if (format === 'docx') {
-    exportReviewMarkdown(nodes, allComments, allReview);
+    await exportReviewDocxOrFallback(nodes, allComments, allReview);
     return;
   }
 
@@ -2053,7 +2053,7 @@ async function nodeImageToBase64(node) {
   return null;
 }
 
-function exportReviewMarkdown(nodes, allComments, allReview) {
+function buildReviewMarkdown(nodes, allComments, allReview) {
   const projectTitle = META.title || PROJECT_ID;
   const now = new Date().toLocaleString('zh-CN');
   const lines = [`# ${projectTitle} 评审纪要`, '', `> 导出时间：${now}`, ''];
@@ -2077,16 +2077,50 @@ function exportReviewMarkdown(nodes, allComments, allReview) {
     }
     lines.push('---', '');
   }
+  return lines.join('\n');
+}
 
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
-  const pid = projectTitle.replace(/[\s\/\\:]/g, '-');
-  const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url; a.download = `MindDeck-${pid}-纪要-${ts}.md`;
+  a.href = url; a.download = filename;
   document.body.appendChild(a); a.click();
   setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 0);
-  showToast('已下载 Markdown 格式纪要。可拖到 Claude Code，让它用 python-docx 转为正式 .docx');
+}
+
+// 优先调本地服务一键转 .docx；服务不可达 / 失败时回退到 .md 下载并提示。
+async function exportReviewDocxOrFallback(nodes, allComments, allReview) {
+  const projectTitle = META.title || PROJECT_ID;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
+  const pid = projectTitle.replace(/[\s\/\\:]/g, '-');
+  const baseName = `MindDeck-${pid}-纪要-${ts}`;
+  const md = buildReviewMarkdown(nodes, allComments, allReview);
+
+  // 走本地 OCR 服务的 /md-to-docx 端点（python-docx）
+  try {
+    const resp = await fetch('http://localhost:8788/md-to-docx', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ markdown: md, filename: baseName + '.docx' }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (resp.ok) {
+      const blob = await resp.blob();
+      downloadBlob(blob, baseName + '.docx');
+      showToast(`评审纪要已导出 .docx（${nodes.length} 个页面）`);
+      return;
+    }
+    // 服务返回但失败：记错误信息，回退 md
+    const errBody = await resp.text().catch(() => '');
+    console.warn(`[md-to-docx] 服务端 ${resp.status}: ${errBody}`);
+  } catch (e) {
+    console.warn('[md-to-docx] 本地服务不可达', e);
+  }
+
+  // Fallback: 下载 markdown
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  downloadBlob(blob, baseName + '.md');
+  showToast('本地服务未启动，已下载 markdown。跑 `bash scripts/start.sh` 后重试可一键导出 .docx');
 }
 
 function buildReviewHtml({ nodes, allComments, allReview, hsAll, imageMap, stats }) {
@@ -2534,10 +2568,14 @@ async function matchReviewToNodes(reviewText) {
       body: JSON.stringify({ nodes: nodeList.slice(0, 80), reviewText }),
     });
     serverReached = true;
-    const data = await resp.json().catch(() => null);
+    let data = null;
+    let parseFailed = false;
+    try { data = await resp.json(); } catch { parseFailed = true; }
     if (resp.ok && Array.isArray(data)) return data; // 数组（含空数组）都视为有效结果
     // 服务端报错但能联通 → 透传错误，不再 fallback（fallback 会被 CORS 拦截，徒增混乱）
-    const msg = data && data.error ? data.error : `HTTP ${resp.status}`;
+    const msg = (data && data.error)
+      ? data.error
+      : (parseFailed ? `HTTP ${resp.status}（响应非 JSON）` : `HTTP ${resp.status}`);
     throw new Error(`本地服务返回错误：${msg}`);
   } catch (e) {
     if (serverReached) throw e;
@@ -2668,7 +2706,7 @@ function showReviewMatchCandidates(matches) {
       (m.newTodos || []).forEach((t, ti) => {
         if (!overlay.querySelector(`#rv-todo-${i}-${ti}`)?.checked) return;
         curList.push({
-          id: 'c_' + now + '_' + Math.random().toString(36).slice(2, 6),
+          id: 'c_' + now + '_' + i + '_' + ti + '_' + Math.random().toString(36).slice(2, 6),
           xPct: 50, yPct: 50, text: t.text,
           status: t.status || 'open', kind: 'todo',
           createdAt: now, updatedAt: now,
@@ -2920,24 +2958,99 @@ function setupZoom() {
   }
 }
 
+// 关闭所有下拉并同步 aria-expanded（except 不动）。集中在一处避免遗漏。
+function closeAllDropdowns(except) {
+  document.querySelectorAll('.tbtn-menu').forEach(m => {
+    if (m === except || m.hidden) return;
+    m.hidden = true;
+    const trigger = document.querySelector(`[aria-controls="${m.id}"]`);
+    if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  });
+}
+
 function setupDropdown(buttonId, menuId) {
   const btn = document.getElementById(buttonId);
   const menu = document.getElementById(menuId);
   if (!btn || !menu) return;
+
+  // 给菜单项标 role + tabindex（HTML 上只标了 role="menu"，避免在每个 li 重复手写）
+  menu.querySelectorAll('li[data-act]').forEach(li => {
+    li.setAttribute('role', 'menuitem');
+    if (!li.hasAttribute('tabindex')) li.setAttribute('tabindex', '-1');
+  });
+  menu.querySelectorAll('li.sep').forEach(li => li.setAttribute('role', 'separator'));
+
+  const items = () => Array.from(menu.querySelectorAll('li[data-act]:not(.disabled)'));
+
+  function open(focusTarget /* 'first' | 'last' | null */) {
+    closeAllDropdowns(menu);
+    menu.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+    const list = items();
+    if (focusTarget === 'first') list[0]?.focus();
+    else if (focusTarget === 'last') list[list.length - 1]?.focus();
+  }
+  function close(returnFocus) {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+    if (returnFocus) btn.focus();
+  }
+
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
-    // 关闭其他下拉
-    document.querySelectorAll('.tbtn-menu').forEach(m => { if (m !== menu) m.hidden = true; });
-    menu.hidden = !menu.hidden;
+    if (menu.hidden) open(null); else close(false);
   });
+
+  // 触发按钮键盘：↓ / Enter / Space → 打开并聚焦首项；↑ → 打开并聚焦末项
+  btn.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault(); e.stopPropagation();
+      open('first');
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault(); e.stopPropagation();
+      open('last');
+    }
+  });
+
   menu.addEventListener('click', (e) => {
     const li = e.target.closest('li[data-act]');
-    if (!li) return;
-    if (li.classList.contains('disabled')) return;
+    if (!li || li.classList.contains('disabled')) return;
     const act = li.dataset.act;
-    menu.hidden = true;
+    close(false);
     const fn = TOOLBAR_ACTIONS[act];
     if (fn) fn();
+  });
+
+  // 菜单内键盘导航：↑↓ 循环 / Home End / Esc 关闭并回焦 / Enter Space 触发 / Tab 关闭并继续 tab
+  menu.addEventListener('keydown', (e) => {
+    const list = items();
+    const idx = list.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault(); e.stopPropagation();
+      list[(idx + 1 + list.length) % list.length]?.focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault(); e.stopPropagation();
+      list[(idx - 1 + list.length) % list.length]?.focus();
+    } else if (e.key === 'Home') {
+      e.preventDefault(); e.stopPropagation();
+      list[0]?.focus();
+    } else if (e.key === 'End') {
+      e.preventDefault(); e.stopPropagation();
+      list[list.length - 1]?.focus();
+    } else if (e.key === 'Escape') {
+      e.preventDefault(); e.stopPropagation();
+      close(true);
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault(); e.stopPropagation();
+      if (idx >= 0) list[idx].click();
+    } else if (e.key === 'Tab') {
+      // Tab 关闭菜单但允许浏览器继续移动焦点（不 preventDefault）
+      close(false);
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      // 拦住，避免冒泡到 window 触发原型左右翻页
+      e.stopPropagation();
+    }
   });
 }
 
@@ -2971,19 +3084,20 @@ function setupToolbar() {
   });
 
   // 点击外部关闭所有下拉
-  document.addEventListener('click', () => {
-    document.querySelectorAll('.tbtn-menu').forEach(m => { m.hidden = true; });
-  });
+  document.addEventListener('click', () => closeAllDropdowns(null));
 
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    // 焦点在菜单内时，菜单的 keydown 已自行处理并 stopPropagation。
+    // 这里再加一道兜底，防止 ArrowUp 等漏到全局后误触父级跳转。
+    if (e.target.closest && e.target.closest('.tbtn-menu')) return;
     if (e.key === 'ArrowLeft') document.getElementById('btn-prev').click();
     else if (e.key === 'ArrowRight') document.getElementById('btn-next').click();
     else if (e.key === 'ArrowUp') document.getElementById('btn-parent').click();
     else if (e.key === 'h' || e.key === 'H') toggleHotspots();
     else if (e.key === 'c' || e.key === 'C') document.getElementById('btn-comment-mode').click();
     else if (e.key === 'Escape') {
-      document.querySelectorAll('.tbtn-menu').forEach(m => { m.hidden = true; });
+      closeAllDropdowns(null);
       closeAllPopovers();
     }
   });
